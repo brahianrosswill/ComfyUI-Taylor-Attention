@@ -22,6 +22,9 @@ designed for large token counts where quadratic attention becomes expensive.
   - `block_size_q` / `block_size_k`: block sizes for memory control.
   - `fallback_on_negative`: fallback to standard attention if denominators are too small.
   - `force_fp32`: accumulate Taylor features in fp32 for stability (disable to reduce memory).
+  - `memory_reserve`: ask ComfyUI to free VRAM before Taylor attention allocations.
+  - `memory_reserve_factor`: safety multiplier for the VRAM estimate.
+  - `memory_reserve_log`: log reserved VRAM estimates.
   - `quality_check`: log a sampled softmax vs Taylor comparison per call.
   - `quality_check_samples`: number of sampled queries per call.
   - `quality_check_log_every`: log every N Taylor calls.

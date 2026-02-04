@@ -192,6 +192,11 @@ def test_force_fp32_config_respected():
     cfg = taylor_attention._resolve_config({"enabled": True, "force_fp32": False})
     assert cfg.force_fp32 is False
 
+def test_memory_reserve_config_respected():
+    cfg = taylor_attention._resolve_config({"enabled": True, "memory_reserve": False, "memory_reserve_factor": 1.5})
+    assert cfg.memory_reserve is False
+    assert cfg.memory_reserve_factor == 1.5
+
 
 def test_quality_check_logs(caplog):
     device = torch.device("cpu")

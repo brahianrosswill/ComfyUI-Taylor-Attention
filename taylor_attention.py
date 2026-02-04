@@ -7,6 +7,11 @@ import torch
 
 import taylor_sym_features
 
+try:
+    from comfy import model_management
+except Exception:
+    model_management = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +34,9 @@ class TaylorAttentionConfig:
     allow_cross_attention: bool = True
     max_head_dim: int = 128
     force_fp32: bool = True
+    memory_reserve: bool = True
+    memory_reserve_factor: float = 1.1
+    memory_reserve_log: bool = False
     log_shapes: bool = False
     log_fallbacks: bool = True
     log_every: int = 100
@@ -133,6 +141,59 @@ def _run_quality_check(
         max_abs,
         mean_rel,
     )
+
+
+
+
+
+def _estimate_taylor_memory_bytes(batch: int, heads: int, n_q: int, d_val: int, feature_dim: int, m_max: int, block_q: int, block_k: int, dtype_size: int) -> int:
+    core_elems = batch * heads * (feature_dim * d_val + feature_dim + n_q * d_val)
+    temp_elems = batch * heads * (max(block_q, block_k) * m_max * 2)
+    return int((core_elems + temp_elems) * dtype_size)
+
+
+
+def _maybe_reserve_memory(
+    cfg: TaylorAttentionConfig,
+    q: torch.Tensor,
+    v: torch.Tensor,
+    feature_dim: int,
+    specs,
+    block_q: int,
+    block_k: int,
+    transformer_options: Optional[dict],
+    dtype_accum: torch.dtype,
+) -> None:
+    if not cfg.memory_reserve:
+        return
+    if model_management is None:
+        return
+    if q.device.type == "cpu":
+        return
+    if len(specs) == 0:
+        return
+
+    batch, heads, n_q, _ = q.shape
+    d_val = v.shape[-1]
+    m_max = max(spec.indices.shape[0] for spec in specs)
+    dtype_size = torch.tensor([], dtype=dtype_accum).element_size()
+    mem_bytes = _estimate_taylor_memory_bytes(batch, heads, n_q, d_val, feature_dim, m_max, block_q, block_k, dtype_size)
+    mem_bytes = int(mem_bytes * cfg.memory_reserve_factor)
+    if mem_bytes <= 0:
+        return
+
+    if transformer_options is not None:
+        key = (batch, heads, n_q, d_val, feature_dim, m_max, dtype_size, block_q, block_k, cfg.memory_reserve_factor)
+        if transformer_options.get("taylor_attention_memory_reserved") == key:
+            return
+        transformer_options["taylor_attention_memory_reserved"] = key
+
+    try:
+        model_management.free_memory(mem_bytes, q.device)
+        if cfg.memory_reserve_log:
+            logger.info("Taylor attention reserved ~%.2f MB", mem_bytes / (1024 * 1024))
+    except Exception as exc:
+        logger.warning("Taylor attention reserve memory failed: %s", exc)
 
 
 def _log_shapes_once(config: TaylorAttentionConfig, transformer_options: Optional[dict], q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor], scale: float, skip_reshape: bool) -> None:
@@ -300,6 +361,8 @@ def taylor_attention(
 
     dtype_accum = torch.float32 if cfg.force_fp32 else q.dtype
     v_dtype = v.dtype
+    block_k = max(1, cfg.block_size_k)
+    block_q = max(1, cfg.block_size_q)
 
     if mask is not None:
         key_mask_bool = _normalize_key_mask(mask, batch, heads, n_q, n_k).to(device=q.device)
@@ -311,6 +374,8 @@ def taylor_attention(
 
     specs = taylor_sym_features.get_feature_specs(dim_head, cfg.P, q.device)
 
+    _maybe_reserve_memory(cfg, q, v, feature_dim, specs, block_q, block_k, transformer_options, dtype_accum)
+
     s = torch.zeros((batch, heads, feature_dim, v.shape[-1]), dtype=dtype_accum, device=q.device)
     z = torch.zeros((batch, heads, feature_dim), dtype=dtype_accum, device=q.device)
 
@@ -321,7 +386,6 @@ def taylor_attention(
         sqrt_betas.append(torch.tensor(math.sqrt(beta), dtype=dtype_accum, device=q.device))
         sqrt_ws.append(spec.sqrt_w.to(dtype=dtype_accum))
 
-    block_k = max(1, cfg.block_size_k)
     offset = 0
     for spec, sqrt_beta, sqrt_w in zip(specs, sqrt_betas, sqrt_ws):
         m_p = spec.indices.shape[0]
@@ -341,7 +405,6 @@ def taylor_attention(
         offset += m_p
 
     out = torch.empty((batch, heads, n_q, v.shape[-1]), dtype=dtype_accum, device=q.device)
-    block_q = max(1, cfg.block_size_q)
 
     for start in range(0, n_q, block_q):
         end = min(start + block_q, n_q)
