@@ -32,6 +32,9 @@ class TaylorAttentionConfig:
     log_shapes: bool = False
     log_fallbacks: bool = True
     log_every: int = 100
+    quality_check: bool = False
+    quality_check_samples: int = 8
+    quality_check_log_every: int = 1
 
 
 _GLOBAL_STATS: Dict[str, Any] = {
@@ -40,6 +43,7 @@ _GLOBAL_STATS: Dict[str, Any] = {
     "fallback_calls": 0,
     "fallback_reasons": {},
 }
+_QUALITY_CHECK_CALLS = 0
 
 
 def _update_stats(reason: Optional[str] = None, used_taylor: bool = False) -> None:
@@ -73,6 +77,62 @@ def _resolve_config(config: Optional[Dict[str, Any]]) -> TaylorAttentionConfig:
         if hasattr(cfg, key):
             setattr(cfg, key, value)
     return cfg
+
+
+def _quality_check_should_log(cfg: TaylorAttentionConfig) -> bool:
+    global _QUALITY_CHECK_CALLS
+    _QUALITY_CHECK_CALLS += 1
+    if cfg.quality_check_log_every <= 0:
+        return False
+    return (_QUALITY_CHECK_CALLS % cfg.quality_check_log_every) == 0
+
+
+def _run_quality_check(
+    cfg: TaylorAttentionConfig,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    key_mask_bool: Optional[torch.Tensor],
+    scale: float,
+) -> None:
+    if not cfg.quality_check:
+        return
+    if not _quality_check_should_log(cfg):
+        return
+
+    batch, heads, n_q, dim_head = q.shape
+    n_k = k.shape[2]
+    samples = min(cfg.quality_check_samples, n_q)
+    if samples <= 0:
+        return
+
+    idx = torch.randperm(n_q, device=q.device)[:samples]
+    q_s = q[:, :, idx, :].float()
+    k_f = k.float()
+    v_f = v.float()
+
+    scores = torch.einsum("b h s d, b h n d -> b h s n", q_s, k_f) * scale
+    if key_mask_bool is not None:
+        mask = key_mask_bool[:, None, None, :].to(device=scores.device)
+        scores = scores.masked_fill(~mask, float("-inf"))
+
+    attn = torch.softmax(scores, dim=-1)
+    exact = torch.einsum("b h s n, b h n d -> b h s d", attn, v_f)
+
+    approx = out[:, :, idx, :].float()
+    diff = (approx - exact).abs()
+    mean_abs = diff.mean().item()
+    max_abs = diff.max().item()
+    mean_rel = (diff / (exact.abs() + 1e-6)).mean().item()
+
+    logger.info(
+        "Taylor quality check: samples=%s mean_abs=%.6f max_abs=%.6f mean_rel=%.6f",
+        samples,
+        mean_abs,
+        max_abs,
+        mean_rel,
+    )
 
 
 def _log_shapes_once(config: TaylorAttentionConfig, transformer_options: Optional[dict], q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor], scale: float, skip_reshape: bool) -> None:
@@ -239,10 +299,11 @@ def taylor_attention(
     _log_shapes_once(cfg, transformer_options, q, k, v, mask, scale, skip_reshape)
 
     if mask is not None:
-        key_mask = _normalize_key_mask(mask, batch, heads, n_q, n_k)
-        key_mask = key_mask.to(device=q.device, dtype=torch.float32)
+        key_mask_bool = _normalize_key_mask(mask, batch, heads, n_q, n_k).to(device=q.device)
+        key_mask = key_mask_bool.to(dtype=torch.float32)
         key_mask = key_mask[:, None, :]
     else:
+        key_mask_bool = None
         key_mask = None
 
     specs = taylor_sym_features.get_feature_specs(dim_head, cfg.P, q.device)
@@ -301,6 +362,8 @@ def taylor_attention(
             raise TaylorAttentionFallback("denominator_too_small")
         den = torch.clamp(den, min=cfg.eps)
         out[:, :, start:end, :] = num / den[..., None]
+
+    _run_quality_check(cfg, q, k, v, out, key_mask_bool, scale)
 
     out = out.to(dtype=v_dtype)
     if skip_output_reshape:

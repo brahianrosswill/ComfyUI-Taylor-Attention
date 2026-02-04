@@ -191,3 +191,41 @@ def test_feature_dim_too_large_logs(caplog):
 def test_force_fp32_config_respected():
     cfg = taylor_attention._resolve_config({"enabled": True, "force_fp32": False})
     assert cfg.force_fp32 is False
+
+
+def test_quality_check_logs(caplog):
+    device = torch.device("cpu")
+    batch = 1
+    heads = 2
+    tokens = 32
+    dim_head = 16
+
+    q, k, v = _make_qkv(batch, heads, tokens, dim_head, device)
+
+    config = {
+        "enabled": True,
+        "P": 3,
+        "min_tokens": 0,
+        "max_feature_dim_R": 200000,
+        "block_size_q": 32,
+        "block_size_k": 32,
+        "eps": 1e-6,
+        "fallback_on_negative": False,
+        "allow_cross_attention": True,
+        "max_head_dim": 128,
+        "quality_check": True,
+        "quality_check_samples": 4,
+        "quality_check_log_every": 1,
+    }
+
+    caplog.set_level(logging.INFO, logger="taylor_attention")
+    taylor_attention.taylor_attention(
+        q,
+        k,
+        v,
+        heads,
+        skip_reshape=True,
+        config=config,
+    )
+
+    assert "Taylor quality check" in caplog.text
