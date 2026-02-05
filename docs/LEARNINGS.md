@@ -24,3 +24,4 @@
 - Added qk_norm_sigma_max to gate q/k normalization by sigma.
 - Streaming fused memory reservation now estimates based on chunk sizes to avoid over-offloading.
 - Added taylor_sigma_max and taylor_layer_start/end gates to skip Taylor at high sigma or outside block ranges.
+- quality_raw and quality_eff now share the same sampled query indices for apples-to-apples comparisons.

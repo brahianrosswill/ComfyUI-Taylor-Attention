@@ -611,6 +611,16 @@ def _apply_qk_norm(
     return q_eff, k_eff
 
 
+def _sample_quality_indices(cfg: TaylorAttentionConfig, q: torch.Tensor) -> Optional[torch.Tensor]:
+    n_q = q.shape[-2]
+    if cfg.quality_check_samples <= 0 or n_q <= 0:
+        return None
+    samples = min(cfg.quality_check_samples, n_q)
+    if samples <= 0:
+        return None
+    return torch.randperm(n_q, device=q.device)[:samples]
+
+
 def _compute_quality_stats(
     cfg: TaylorAttentionConfig,
     q: torch.Tensor,
@@ -619,13 +629,21 @@ def _compute_quality_stats(
     out: torch.Tensor,
     key_mask_bool: Optional[torch.Tensor],
     scale: float,
+    idx: Optional[torch.Tensor] = None,
 ) -> Optional[Dict[str, float]]:
     batch, heads, n_q, dim_head = q.shape
-    samples = min(cfg.quality_check_samples, n_q)
-    if samples <= 0:
+    if idx is None:
+        idx = _sample_quality_indices(cfg, q)
+    if idx is None or idx.numel() == 0:
         return None
 
-    idx = torch.randperm(n_q, device=q.device)[:samples]
+    if idx.device != q.device:
+        idx = idx.to(device=q.device)
+    if idx.dtype != torch.long:
+        idx = idx.to(dtype=torch.long)
+    if idx.numel() > n_q:
+        idx = idx[:n_q]
+
     q_s = q[:, :, idx, :].float()
     k_f = k.float()
     v_f = v.float()
@@ -1171,8 +1189,9 @@ def _taylor_attention_fused(
         den = den.to(dtype_accum)
     out = out / den[..., None]
 
-    quality_raw = None if skip_quality_stats else _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base)
-    quality_eff = None if skip_quality_stats else _compute_quality_stats(cfg, q, k, v, out, key_mask_bool, scale)
+    idx = None if skip_quality_stats else _sample_quality_indices(cfg, q_orig)
+    quality_raw = None if skip_quality_stats else _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base, idx=idx)
+    quality_eff = None if skip_quality_stats else _compute_quality_stats(cfg, q, k, v, out, key_mask_bool, scale, idx=idx)
     if den_stats_out is not None:
         _merge_den_stats(den_stats_out, den_stats)
     if step_stats is not None:
@@ -1280,8 +1299,9 @@ def taylor_attention(
         out = torch.cat(sub_outputs, dim=-1)
         if step_stats is not None:
             q_eff, k_eff = _apply_qk_norm(cfg, q_orig, k_orig, dtype_accum=torch.float32, sigma=_get_sigma(transformer_options))
-            quality_raw = _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base)
-            quality_eff = _compute_quality_stats(cfg, q_eff, k_eff, v, out, key_mask_bool, scale)
+            idx = _sample_quality_indices(cfg, q_orig)
+            quality_raw = _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base, idx=idx)
+            quality_eff = _compute_quality_stats(cfg, q_eff, k_eff, v, out, key_mask_bool, scale, idx=idx)
             _merge_quality_stats(step_stats["quality"], quality_raw)
             step_stats["quality_raw"] = _quality_stats_to_summary(quality_raw)
             step_stats["quality_eff"] = _quality_stats_to_summary(quality_eff)
@@ -1453,7 +1473,8 @@ def taylor_attention(
             den = den.to(dtype_accum)
         out[:, :, start:end, :] = num / den[..., None]
 
-    quality_stats = None if skip_quality_stats else _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base)
+    idx = None if skip_quality_stats else _sample_quality_indices(cfg, q_orig)
+    quality_stats = None if skip_quality_stats else _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base, idx=idx)
     if den_stats_out is not None:
         _merge_den_stats(den_stats_out, den_stats)
     if step_stats is not None:

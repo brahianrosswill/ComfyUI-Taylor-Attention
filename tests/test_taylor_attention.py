@@ -493,3 +493,28 @@ def test_quality_check_logs(caplog):
     )
 
     assert "Taylor step stats" in caplog.text
+
+
+def test_quality_stats_respect_indices():
+    device = torch.device("cpu")
+    batch = 1
+    heads = 2
+    tokens = 8
+    dim_head = 16
+
+    torch.manual_seed(0)
+    q, k, v = _make_qkv(batch, heads, tokens, dim_head, device)
+    out = torch.zeros_like(q)
+    scale = dim_head ** -0.5
+
+    cfg = taylor_attention._resolve_config({"enabled": True, "quality_check_samples": 4})
+    idx_a = torch.tensor([0, 1, 2, 3], device=device)
+    idx_b = torch.tensor([4, 5, 6, 7], device=device)
+
+    torch.manual_seed(0)
+    stats_a = taylor_attention._compute_quality_stats(cfg, q, k, v, out, None, scale, idx=idx_a)
+    torch.manual_seed(0)
+    stats_b = taylor_attention._compute_quality_stats(cfg, q, k, v, out, None, scale, idx=idx_b)
+
+    assert stats_a is not None and stats_b is not None
+    assert stats_a["sum_abs"] != stats_b["sum_abs"]
