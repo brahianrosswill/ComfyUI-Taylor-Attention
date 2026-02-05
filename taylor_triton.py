@@ -50,6 +50,7 @@ def _fused_num_den_kernel(
     BLOCK_Q: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    COMPUTE_DEN: tl.constexpr,
 ):
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
@@ -61,7 +62,8 @@ def _fused_num_den_kernel(
     mask_d = offs_d < D
 
     acc_num = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-    acc_den = tl.zeros((BLOCK_Q,), dtype=tl.float32)
+    if tl.constexpr(COMPUTE_DEN):
+        acc_den = tl.zeros((BLOCK_Q,), dtype=tl.float32)
 
     r = 0
     while r < R:
@@ -84,9 +86,10 @@ def _fused_num_den_kernel(
 
         acc_num += tl.dot(psi, s_block)
 
-        z_ptrs = z_ptr + pid_bh * stride_bh_z + offs_r * stride_r_z
-        z_block = tl.load(z_ptrs, mask=mask_r, other=0.0)
-        acc_den += tl.sum(psi * z_block[None, :], axis=1)
+        if tl.constexpr(COMPUTE_DEN):
+            z_ptrs = z_ptr + pid_bh * stride_bh_z + offs_r * stride_r_z
+            z_block = tl.load(z_ptrs, mask=mask_r, other=0.0)
+            acc_den += tl.sum(psi * z_block[None, :], axis=1)
 
         r += BLOCK_R
 
@@ -99,7 +102,7 @@ def _fused_num_den_kernel(
     out_val = out_prev + acc_num
     tl.store(out_ptrs, out_val, mask=mask_q[:, None] & mask_d[None, :])
 
-    if pid_d == 0:
+    if tl.constexpr(COMPUTE_DEN) and pid_d == 0:
         den_ptrs = den_ptr + pid_bh * stride_bh_den + offs_q * stride_q_den
         den_prev = tl.load(den_ptrs, mask=mask_q, other=0.0)
         den_val = den_prev + acc_den
@@ -115,6 +118,7 @@ def fused_num_den(
     block_q: int = 16,
     block_d: int = 32,
     block_r: int = 32,
+    compute_den: bool = True,
 ) -> None:
     if not is_available(psi_q.device):
         raise RuntimeError("triton_unavailable")
@@ -167,6 +171,6 @@ def fused_num_den(
         BLOCK_Q=block_q,
         BLOCK_D=block_d,
         BLOCK_R=block_r,
+        COMPUTE_DEN=compute_den,
         num_warps=4,
     )
-

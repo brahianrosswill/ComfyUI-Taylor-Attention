@@ -53,6 +53,8 @@ class TaylorAttentionConfig:
     denom_fallback_frac_limit: float = 0.0
     fused_kernel: bool = False
     fused_feature_chunk_size: int = 8192
+    fused_value_chunk_size: int = 0
+    s_store_bf16: bool = False
     auto_tune: bool = False
     auto_tune_steps: int = 1
     auto_tune_candidates: int = 8
@@ -124,6 +126,8 @@ def _config_summary(cfg: TaylorAttentionConfig) -> Dict[str, Any]:
         "denom_fallback_frac_limit": cfg.denom_fallback_frac_limit,
         "fused_kernel": cfg.fused_kernel,
         "fused_feature_chunk_size": cfg.fused_feature_chunk_size,
+        "fused_value_chunk_size": cfg.fused_value_chunk_size,
+        "s_store_bf16": cfg.s_store_bf16,
     }
 
 _DIAG_SAMPLE_Q = 64
@@ -468,7 +472,7 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
         "reasons=%s "
         "den[min=%.6g max=%.6g mean=%.6g frac_le_eps=%.6g] "
         "quality[mean_abs=%.6g max_abs=%.6g mean_rel=%.6g max_rel=%.6g samples=%s] "
-        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s max_head_dim=%s force_fp32=%s denom_fp32=%s probe_samples=%s denom_fallback_frac_limit=%.3g fused_kernel=%s fused_feature_chunk_size=%s]%s",
+        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s max_head_dim=%s force_fp32=%s denom_fp32=%s probe_samples=%s denom_fallback_frac_limit=%.3g fused_kernel=%s fused_feature_chunk_size=%s fused_value_chunk_size=%s s_store_bf16=%s]%s",
         sigma,
         calls,
         step_stats["taylor_calls"],
@@ -496,6 +500,8 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
         cfg_summary["denom_fallback_frac_limit"],
         cfg_summary["fused_kernel"],
         cfg_summary["fused_feature_chunk_size"],
+        cfg_summary["fused_value_chunk_size"],
+        cfg_summary["s_store_bf16"],
         diag_str,
     )
 
@@ -911,6 +917,11 @@ def _taylor_attention_fused(
     block_k = max(1, cfg.block_size_k)
     block_q = max(1, cfg.block_size_q)
     chunk_size = max(1, cfg.fused_feature_chunk_size)
+    value_chunk = cfg.fused_value_chunk_size
+    if value_chunk <= 0:
+        value_chunk = v.shape[-1]
+    value_chunk = max(1, min(value_chunk, v.shape[-1]))
+    s_dtype = torch.bfloat16 if cfg.s_store_bf16 else dtype_accum
 
     if key_mask_bool is not None:
         key_mask = key_mask_bool.to(dtype=dtype_accum)
@@ -951,21 +962,16 @@ def _taylor_attention_fused(
             indices = spec.indices[seg_start:seg_end]
             sqrt_w_seg = sqrt_w[seg_start:seg_end]
 
-            s_chunk = torch.zeros((batch, heads, seg_end - seg_start, v.shape[-1]), dtype=dtype_accum, device=q.device)
             z_chunk = torch.zeros((batch, heads, seg_end - seg_start), dtype=dtype_accum, device=q.device)
-
             for start in range(0, n_k, block_k):
                 end = min(start + block_k, n_k)
                 k_blk = k[:, :, start:end, :]
-                v_blk = v[:, :, start:end, :]
                 k_blk_f = k_blk.to(dtype=dtype_accum)
-                v_blk_f = v_blk.to(dtype=dtype_accum)
                 phi_k = taylor_sym_features.eval_phi(k_blk_f, indices)
                 psi_k = phi_k * sqrt_w_seg * sqrt_beta
                 if key_mask is not None:
                     mask_blk = key_mask[:, :, start:end]
                     psi_k = psi_k * mask_blk[..., None]
-                s_chunk += torch.einsum("b h n r, b h n d -> b h r d", psi_k, v_blk_f)
                 z_chunk += psi_k.sum(dim=2)
 
             if den_probe is not None and q_probe is not None:
@@ -976,23 +982,53 @@ def _taylor_attention_fused(
                 else:
                     den_probe += torch.einsum("b h n r, b h r -> b h n", psi_qp, z_chunk)
 
-            for start in range(0, n_q, block_q):
-                end = min(start + block_q, n_q)
-                q_blk = q[:, :, start:end, :]
-                q_blk_f = q_blk.to(dtype=dtype_accum)
-                phi_q = taylor_sym_features.eval_phi(q_blk_f, indices)
-                psi_q = phi_q * sqrt_w_seg * sqrt_beta
+            den_done = False
+            for d_start in range(0, v.shape[-1], value_chunk):
+                d_end = min(d_start + value_chunk, v.shape[-1])
+                s_chunk = torch.zeros((batch, heads, seg_end - seg_start, d_end - d_start), dtype=s_dtype, device=q.device)
+                for start in range(0, n_k, block_k):
+                    end = min(start + block_k, n_k)
+                    k_blk = k[:, :, start:end, :]
+                    v_blk = v[:, :, start:end, :]
+                    k_blk_f = k_blk.to(dtype=dtype_accum)
+                    v_blk_f = v_blk.to(dtype=dtype_accum)
+                    v_blk_slice = v_blk_f[..., d_start:d_end]
+                    phi_k = taylor_sym_features.eval_phi(k_blk_f, indices)
+                    psi_k = phi_k * sqrt_w_seg * sqrt_beta
+                    if key_mask is not None:
+                        mask_blk = key_mask[:, :, start:end]
+                        psi_k = psi_k * mask_blk[..., None]
+                    contrib = torch.einsum("b h n r, b h n d -> b h r d", psi_k, v_blk_slice)
+                    if contrib.dtype != s_chunk.dtype:
+                        contrib = contrib.to(dtype=s_chunk.dtype)
+                    s_chunk += contrib
 
-                out_block = out[:, :, start:end, :]
-                den_block = den[:, :, start:end]
-                if fused_available:
-                    taylor_triton.fused_num_den(psi_q, s_chunk, z_chunk, out_block, den_block)
-                else:
-                    out_block += torch.einsum("b h n r, b h r d -> b h n d", psi_q, s_chunk)
-                    if cfg.denom_fp32:
-                        den_block += torch.einsum("b h n r, b h r -> b h n", psi_q.float(), z_chunk.float())
+                for start in range(0, n_q, block_q):
+                    end = min(start + block_q, n_q)
+                    q_blk = q[:, :, start:end, :]
+                    q_blk_f = q_blk.to(dtype=dtype_accum)
+                    phi_q = taylor_sym_features.eval_phi(q_blk_f, indices)
+                    psi_q = phi_q * sqrt_w_seg * sqrt_beta
+
+                    out_block = out[:, :, start:end, d_start:d_end]
+                    den_block = den[:, :, start:end]
+                    if fused_available:
+                        taylor_triton.fused_num_den(
+                            psi_q,
+                            s_chunk,
+                            z_chunk,
+                            out_block,
+                            den_block,
+                            compute_den=not den_done,
+                        )
                     else:
-                        den_block += torch.einsum("b h n r, b h r -> b h n", psi_q, z_chunk)
+                        out_block += torch.einsum("b h n r, b h r d -> b h n d", psi_q, s_chunk)
+                        if not den_done:
+                            if cfg.denom_fp32:
+                                den_block += torch.einsum("b h n r, b h r -> b h n", psi_q.float(), z_chunk.float())
+                            else:
+                                den_block += torch.einsum("b h n r, b h r -> b h n", psi_q, z_chunk)
+                den_done = True
 
     if den_probe is not None:
         if torch.isnan(den_probe).any() or torch.isinf(den_probe).any():

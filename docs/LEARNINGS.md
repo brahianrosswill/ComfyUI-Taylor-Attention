@@ -16,3 +16,4 @@
 - Added a Triton fused-kernel path that streams Taylor feature chunks to avoid full feature tensor allocation.
 - Early-probe fallbacks now respect denom_fallback_frac_limit and log probe stats for debugging.
 - Step stats now surface fallback reasons and max_head_dim for easier triage.
+- Added fused value-dimension chunking and bf16 S-chunk storage to reduce memory in fused path.
