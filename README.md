@@ -17,21 +17,23 @@ designed for large token counts where quadratic attention becomes expensive.
 - Set `backend` to `taylor` to enable, or `standard` to disable.
 - Key parameters:
   - `P`: number of Taylor terms (default 4).
-  - `min_tokens`: only use Taylor when tokens >= this threshold (default 10000).
-  - `max_feature_dim_R`: safety cap for feature dimension (default 400000).
-  - `sub_head_blocks`: split each head into smaller blocks to reduce feature expansion (approximate).
+  - `min_tokens`: only use Taylor when tokens >= this threshold (default 100).
+  - `max_feature_dim_R`: safety cap for feature dimension (default 370000).
+  - `sub_head_blocks`: split each head into smaller blocks to reduce feature expansion (default 4).
   - `block_size_q` / `block_size_k`: block sizes for memory control (defaults 32 / 16).
   - `fallback_on_negative`: fallback to standard attention if denominators are too small.
-  - `force_fp32`: accumulate Taylor features in fp32 for stability (disable to reduce memory).
+  - `force_fp32`: accumulate Taylor features in fp32 for stability (default false).
   - `memory_reserve`: ask ComfyUI to free VRAM before Taylor attention allocations.
   - `memory_reserve_factor`: safety multiplier for the VRAM estimate.
-  - `memory_reserve_log`: log reserved VRAM estimates.
-  - `early_probe`: run a denominator probe before full Taylor compute (avoids slow fallback).
-  - `probe_samples`: number of queries sampled for the probe.
-  - `denom_fp32`: compute denominators in fp32 to reduce underflow.
-  - `quality_check`: log a sampled softmax vs Taylor comparison per call.
-  - `quality_check_samples`: number of sampled queries per call.
-  - `quality_check_log_every`: log every N Taylor calls.
+  - `memory_reserve_log`: log reserved VRAM estimates (default true).
+  - `early_probe`: run a denominator probe before full Taylor compute (default true).
+  - `probe_samples`: number of queries sampled for the probe (default 16).
+  - `denom_fp32`: compute denominators in fp32 to reduce underflow (default true).
+  - `quality_check`: log a sampled softmax vs Taylor comparison per call (default true).
+  - `quality_check_samples`: number of sampled queries per call (default 16).
+  - `quality_check_log_every`: log every N Taylor calls (default 1).
+  - `log_shapes`: log Taylor attention shapes (default true).
+  - `log_fallbacks`: log Taylor fallbacks (default true).
 
 When enabled, the node injects `optimized_attention_override` into `transformer_options`, so Flux attention calls will route through the Taylor backend and fall back if unsupported masks or stability issues are detected.
 

@@ -25,27 +25,27 @@ class TaylorAttentionFallback(RuntimeError):
 class TaylorAttentionConfig:
     enabled: bool = True
     P: int = 4
-    min_tokens: int = 10000
-    max_feature_dim_R: int = 400000
+    min_tokens: int = 100
+    max_feature_dim_R: int = 370000
     block_size_q: int = 32
     block_size_k: int = 16
     eps: float = 1e-6
     fallback_on_negative: bool = True
     allow_cross_attention: bool = True
     max_head_dim: int = 128
-    sub_head_blocks: int = 1
-    force_fp32: bool = True
+    sub_head_blocks: int = 4
+    force_fp32: bool = False
     memory_reserve: bool = True
     memory_reserve_factor: float = 1.1
-    memory_reserve_log: bool = False
-    early_probe: bool = False
-    probe_samples: int = 8
-    denom_fp32: bool = False
-    log_shapes: bool = False
+    memory_reserve_log: bool = True
+    early_probe: bool = True
+    probe_samples: int = 16
+    denom_fp32: bool = True
+    log_shapes: bool = True
     log_fallbacks: bool = True
     log_every: int = 100
-    quality_check: bool = False
-    quality_check_samples: int = 8
+    quality_check: bool = True
+    quality_check_samples: int = 16
     quality_check_log_every: int = 1
 
 

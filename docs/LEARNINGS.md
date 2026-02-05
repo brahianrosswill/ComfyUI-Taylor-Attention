@@ -5,3 +5,4 @@
 - Taylor attention now estimates its own activation memory and calls ComfyUI's `model_management.free_memory` to prompt offloading before large allocations.
 - Early-probe and fp32 denominator options help avoid slow Taylor fallbacks when denominators go unstable.
 - Sub-head block Taylor splits each head into smaller blocks to reduce feature dimension while keeping P fixed.
+- Defaults now target diffusion-scale workloads (low min_tokens, sub-head blocks, and tighter block sizes).
