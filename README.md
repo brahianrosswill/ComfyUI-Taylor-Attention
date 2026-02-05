@@ -21,6 +21,8 @@ designed for large token counts where quadratic attention becomes expensive.
   - `max_feature_dim_R`: safety cap for feature dimension (default 370000).
   - `sub_head_blocks`: split each head into smaller blocks to reduce feature expansion (default 4).
   - `qk_normalize`: L2-normalize queries/keys before Taylor features (default false).
+  - `qk_norm_clip`: clip L2 norm of queries/keys (default 0, disables).
+  - `qk_norm_power`: soften q/k magnitude by dividing by ||q||^power (default 0, disables).
   - `scale_mul`: additional scale multiplier for q·k before Taylor (default 1.0).
   - `block_size_q` / `block_size_k`: block sizes for memory control (defaults 32 / 16).
   - `fallback_on_negative`: fallback to standard attention if denominators are too small.
@@ -53,6 +55,7 @@ Example (Flux head_dim=128, P=4, max_feature_dim_R=60000):
 - sub_head_blocks=8 -> block_dim=16 -> R=3,876 (very safe, more approximate)
 
 Start with `sub_head_blocks=4` for Flux/Flux2 and only increase if you still hit `feature_dim_too_large` or VRAM pressure. Use `quality_check` to sample accuracy when you change this.
+If P=4 is unstable without changing model behavior, try `qk_norm_clip` or `qk_norm_power` before enabling full `qk_normalize`.
 
 ## Tests
 

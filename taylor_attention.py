@@ -35,6 +35,8 @@ class TaylorAttentionConfig:
     max_head_dim: int = 128
     sub_head_blocks: int = 4
     qk_normalize: bool = False
+    qk_norm_clip: float = 0.0
+    qk_norm_power: float = 0.0
     scale_mul: float = 1.0
     force_fp32: bool = False
     memory_reserve: bool = True
@@ -509,11 +511,23 @@ def taylor_attention(
 
     dtype_accum = torch.float32 if cfg.force_fp32 else q.dtype
     v_dtype = v.dtype
-    if cfg.qk_normalize:
+    if cfg.qk_normalize or cfg.qk_norm_clip > 0 or cfg.qk_norm_power > 0:
         q_f = q.to(dtype=dtype_accum)
         k_f = k.to(dtype=dtype_accum)
-        q = q_f / (torch.norm(q_f, dim=-1, keepdim=True) + cfg.eps)
-        k = k_f / (torch.norm(k_f, dim=-1, keepdim=True) + cfg.eps)
+        q_norm = torch.norm(q_f, dim=-1, keepdim=True) + cfg.eps
+        k_norm = torch.norm(k_f, dim=-1, keepdim=True) + cfg.eps
+        if cfg.qk_normalize:
+            q = q_f / q_norm
+            k = k_f / k_norm
+        else:
+            q = q_f
+            k = k_f
+            if cfg.qk_norm_power > 0:
+                q = q / (q_norm ** cfg.qk_norm_power)
+                k = k / (k_norm ** cfg.qk_norm_power)
+            if cfg.qk_norm_clip > 0:
+                q = q * torch.clamp(cfg.qk_norm_clip / q_norm, max=1.0)
+                k = k * torch.clamp(cfg.qk_norm_clip / k_norm, max=1.0)
     block_k = max(1, cfg.block_size_k)
     block_q = max(1, cfg.block_size_q)
 

@@ -8,3 +8,4 @@
 - Defaults now target diffusion-scale workloads (low min_tokens, sub-head blocks, and tighter block sizes).
 - Denominator stats are now logged on every Taylor call for stability debugging.
 - Added qk_normalize and scale_mul knobs to stabilize P=4 Taylor attention by shrinking q·k values.
+- Added qk_norm_clip and qk_norm_power to stabilize P=4 without fully normalizing Q/K.

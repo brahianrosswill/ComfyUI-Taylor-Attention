@@ -251,6 +251,49 @@ def test_qk_normalize_config_respected():
     assert cfg.scale_mul == 0.5
 
 
+def test_qk_norm_clip_power_config_respected():
+    cfg = taylor_attention._resolve_config({"enabled": True, "qk_norm_clip": 12.5, "qk_norm_power": 0.25})
+    assert cfg.qk_norm_clip == 12.5
+    assert cfg.qk_norm_power == 0.25
+
+
+def test_qk_norm_clip_power_runs():
+    device = torch.device("cpu")
+    batch = 1
+    heads = 2
+    tokens = 32
+    dim_head = 16
+
+    q, k, v = _make_qkv(batch, heads, tokens, dim_head, device)
+
+    config = {
+        "enabled": True,
+        "P": 3,
+        "min_tokens": 0,
+        "max_feature_dim_R": 200000,
+        "block_size_q": 32,
+        "block_size_k": 32,
+        "eps": 1e-6,
+        "fallback_on_negative": False,
+        "allow_cross_attention": True,
+        "max_head_dim": 128,
+        "qk_norm_clip": 10.0,
+        "qk_norm_power": 0.5,
+    }
+
+    out = taylor_attention.taylor_attention(
+        q,
+        k,
+        v,
+        heads,
+        skip_reshape=True,
+        skip_output_reshape=True,
+        config=config,
+    )
+
+    assert out.shape == (batch, heads, tokens, dim_head)
+
+
 def test_qk_normalize_runs():
     device = torch.device("cpu")
     batch = 1
