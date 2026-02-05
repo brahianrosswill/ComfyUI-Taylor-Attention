@@ -84,6 +84,9 @@ def _fused_num_den_kernel(
         )
         s_block = tl.load(s_ptrs, mask=mask_r[:, None] & mask_d[None, :], other=0.0)
 
+        psi = psi.to(tl.float32)
+        s_block = s_block.to(tl.float32)
+
         acc_num += tl.dot(psi, s_block)
 
         if tl.constexpr(COMPUTE_DEN):
