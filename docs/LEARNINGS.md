@@ -11,3 +11,4 @@
 - Added qk_norm_clip and qk_norm_power to stabilize P=4 without fully normalizing Q/K.
 - Denominator fallbacks can now be gated by a fraction threshold to avoid over-triggering.
 - Quality stats are now computed against unmodified attention, even when Q/K are adjusted.
+- Auto-tune mode can search q/k scaling during early steps and lock in a best config.

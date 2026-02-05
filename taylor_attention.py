@@ -1,5 +1,6 @@
 import logging
 import math
+import random
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -46,6 +47,18 @@ class TaylorAttentionConfig:
     probe_samples: int = 16
     denom_fp32: bool = True
     denom_fallback_frac_limit: float = 0.0
+    auto_tune: bool = False
+    auto_tune_steps: int = 1
+    auto_tune_candidates: int = 8
+    auto_tune_quality_samples: int = 4
+    auto_tune_seed: int = 0
+    auto_tune_qk_norm_power_min: float = 0.2
+    auto_tune_qk_norm_power_max: float = 0.7
+    auto_tune_qk_norm_clip_min: float = 8.0
+    auto_tune_qk_norm_clip_max: float = 20.0
+    auto_tune_scale_mul_min: float = 0.8
+    auto_tune_scale_mul_max: float = 1.0
+    auto_tune_max_tokens: int = 512
     log_shapes: bool = True
     log_fallbacks: bool = True
     log_every: int = 100
@@ -103,6 +116,161 @@ def _config_summary(cfg: TaylorAttentionConfig) -> Dict[str, Any]:
         "probe_samples": cfg.probe_samples,
         "denom_fallback_frac_limit": cfg.denom_fallback_frac_limit,
     }
+
+
+def _sample_range(rng, min_val: float, max_val: float) -> float:
+    if max_val <= min_val:
+        return float(min_val)
+    return float(rng.uniform(min_val, max_val))
+
+
+def _auto_tune_state(config: Dict[str, Any]) -> Dict[str, Any]:
+    state = config.get("_auto_tune_state")
+    if state is None:
+        state = {
+            "last_sigma": None,
+            "step_index": 0,
+            "tuned_this_step": False,
+            "best_score": None,
+            "best_config": None,
+        }
+        config["_auto_tune_state"] = state
+    return state
+
+
+def _maybe_auto_tune(
+    config: Dict[str, Any],
+    cfg: TaylorAttentionConfig,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    mask: Optional[torch.Tensor],
+    attn_precision: Optional[torch.dtype],
+    skip_reshape: bool,
+    transformer_options: Optional[dict],
+) -> None:
+    if not cfg.auto_tune:
+        return
+    if cfg.auto_tune_steps <= 0 or cfg.auto_tune_candidates <= 0:
+        return
+    if cfg.qk_normalize:
+        return
+
+    state = _auto_tune_state(config)
+    sigma = None
+    if transformer_options is not None:
+        sigmas = transformer_options.get("sigmas")
+        if isinstance(sigmas, torch.Tensor) and sigmas.numel() > 0:
+            sigma = float(sigmas.flatten()[0].item())
+
+    if sigma is not None and sigma != state["last_sigma"]:
+        state["last_sigma"] = sigma
+        state["tuned_this_step"] = False
+        if state["best_config"] is not None:
+            state["step_index"] += 1
+
+    if state["step_index"] >= cfg.auto_tune_steps:
+        return
+    if state["tuned_this_step"]:
+        return
+
+    rng = random.Random(cfg.auto_tune_seed + int(state["step_index"]))
+    candidates = []
+
+    # include current config as baseline
+    candidates.append({
+        "qk_norm_power": cfg.qk_norm_power,
+        "qk_norm_clip": cfg.qk_norm_clip,
+        "scale_mul": cfg.scale_mul,
+    })
+
+    for _ in range(cfg.auto_tune_candidates):
+        candidates.append({
+            "qk_norm_power": _sample_range(rng, cfg.auto_tune_qk_norm_power_min, cfg.auto_tune_qk_norm_power_max),
+            "qk_norm_clip": _sample_range(rng, cfg.auto_tune_qk_norm_clip_min, cfg.auto_tune_qk_norm_clip_max),
+            "scale_mul": _sample_range(rng, cfg.auto_tune_scale_mul_min, cfg.auto_tune_scale_mul_max),
+        })
+
+    best_score = state["best_score"]
+    best_config = state["best_config"]
+
+    q_eval, k_eval, v_eval, batch, heads_eval, n_q, n_k = _reshape_inputs(q, k, v, heads, skip_reshape)
+
+    mask_eval = mask
+    if mask_eval is not None and cfg.auto_tune_max_tokens > 0:
+        mask_eval = _slice_mask(mask_eval, n_q, n_k, cfg.auto_tune_max_tokens)
+
+    if cfg.auto_tune_max_tokens > 0:
+        max_tokens = cfg.auto_tune_max_tokens
+        q_eval = q_eval[:, :, :max_tokens, :]
+        k_eval = k_eval[:, :, :max_tokens, :]
+        v_eval = v_eval[:, :, :max_tokens, :]
+
+    if mask_eval is not None:
+        key_mask_bool = _normalize_key_mask(mask_eval, batch, heads_eval, q_eval.shape[2], k_eval.shape[2]).to(device=q_eval.device)
+    else:
+        key_mask_bool = None
+
+    scale_base = q_eval.shape[-1] ** -0.5
+
+    for candidate in candidates:
+        cand_cfg = dict(config)
+        cand_cfg.update(candidate)
+        cand_cfg["auto_tune"] = False
+        cand_cfg["quality_check_samples"] = cfg.auto_tune_quality_samples
+
+        den_stats = _init_den_stats()
+        try:
+            out = taylor_attention(
+                q_eval,
+                k_eval,
+                v_eval,
+                heads_eval,
+                mask=mask_eval,
+                attn_precision=attn_precision,
+                skip_reshape=True,
+                skip_output_reshape=True,
+                config=cand_cfg,
+                transformer_options=None,
+                skip_quality_stats=True,
+                skip_step_log=True,
+                den_stats_out=den_stats,
+            )
+        except TaylorAttentionFallback:
+            continue
+        except RuntimeError:
+            continue
+
+        quality_stats = _compute_quality_stats(_resolve_config(cand_cfg), q_eval, k_eval, v_eval, out, key_mask_bool, scale_base)
+        if not quality_stats or quality_stats["samples"] == 0:
+            continue
+
+        mean_abs = quality_stats["sum_abs"] / quality_stats["samples"]
+        denom_frac = (den_stats["le_eps"] / den_stats["count"]) if den_stats["count"] > 0 else 1.0
+        score = mean_abs + (denom_frac * 10.0)
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_config = candidate
+
+    if best_config is not None:
+        config.update(best_config)
+        state["best_score"] = best_score
+        state["best_config"] = best_config
+        if transformer_options is not None:
+            step_stats = transformer_options.get("taylor_step_stats")
+            if step_stats is not None:
+                step_stats["config"] = _config_summary(_resolve_config(config))
+        logger.info(
+            "Taylor auto-tune selected: power=%.3g clip=%.3g scale=%.3g score=%.6g",
+            best_config["qk_norm_power"],
+            best_config["qk_norm_clip"],
+            best_config["scale_mul"],
+            best_score,
+        )
+
+    state["tuned_this_step"] = True
 
 
 def _get_step_stats(transformer_options: Optional[dict], cfg: TaylorAttentionConfig) -> Optional[Dict[str, Any]]:
@@ -462,6 +630,31 @@ def _log_shapes_once(config: TaylorAttentionConfig, transformer_options: Optiona
     )
 
 
+def _slice_mask(mask: torch.Tensor, n_q: int, n_k: int, max_tokens: int) -> torch.Tensor:
+    if max_tokens <= 0:
+        return mask
+    target_q = min(n_q, max_tokens)
+    target_k = min(n_k, max_tokens)
+
+    if mask.ndim == 2:
+        return mask[:, :target_k]
+    if mask.ndim == 3:
+        m = mask
+        if m.shape[1] == n_q and n_q > target_q:
+            m = m[:, :target_q, :]
+        if m.shape[2] == n_k and n_k > target_k:
+            m = m[:, :, :target_k]
+        return m
+    if mask.ndim == 4:
+        m = mask
+        if m.shape[2] == n_q and n_q > target_q:
+            m = m[:, :, :target_q, :]
+        if m.shape[3] == n_k and n_k > target_k:
+            m = m[:, :, :, :target_k]
+        return m
+    return mask
+
+
 def _mask_is_binary(mask: torch.Tensor) -> bool:
     if mask.dtype == torch.bool:
         return True
@@ -573,6 +766,7 @@ def taylor_attention(
     transformer_options: Optional[dict] = None,
     skip_quality_stats: bool = False,
     skip_step_log: bool = False,
+    den_stats_out: Optional[Dict[str, float]] = None,
     **kwargs,
 ) -> torch.Tensor:
     cfg = _resolve_config(config)
@@ -815,6 +1009,8 @@ def taylor_attention(
         out[:, :, start:end, :] = num / den[..., None]
 
     quality_stats = None if skip_quality_stats else _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base)
+    if den_stats_out is not None:
+        _merge_den_stats(den_stats_out, den_stats)
     if step_stats is not None:
         step_stats["taylor_calls"] += 1
         _merge_den_stats(step_stats["den_stats"], den_stats)
@@ -845,6 +1041,8 @@ def taylor_attention_override(original_func, *args, **kwargs):
         step_stats["calls"] += 1
 
     try:
+        if config_dict is not None:
+            _maybe_auto_tune(config_dict, cfg, args[0], args[1], args[2], args[3], kwargs.get("mask", None), kwargs.get("attn_precision", None), kwargs.get("skip_reshape", False), transformer_options)
         out = taylor_attention(*args, config=config_dict, **kwargs)
         _update_stats(used_taylor=True)
         _maybe_log_stats(cfg)

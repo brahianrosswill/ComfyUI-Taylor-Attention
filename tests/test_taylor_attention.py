@@ -209,6 +209,13 @@ def test_denom_fallback_frac_limit_config():
     assert cfg.denom_fallback_frac_limit == 0.001
 
 
+def test_auto_tune_config():
+    cfg = taylor_attention._resolve_config({"enabled": True, "auto_tune": True, "auto_tune_steps": 2, "auto_tune_candidates": 4})
+    assert cfg.auto_tune is True
+    assert cfg.auto_tune_steps == 2
+    assert cfg.auto_tune_candidates == 4
+
+
 def test_sub_head_blocks_config_respected():
     cfg = taylor_attention._resolve_config({"enabled": True, "sub_head_blocks": 3})
     assert cfg.sub_head_blocks == 3

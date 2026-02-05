@@ -34,6 +34,13 @@ designed for large token counts where quadratic attention becomes expensive.
   - `probe_samples`: number of queries sampled for the probe (default 16).
   - `denom_fp32`: compute denominators in fp32 to reduce underflow (default true).
   - `denom_fallback_frac_limit`: fallback only if denom<=eps exceeds this fraction (default 0).
+  - `auto_tune`: stochastic search for q/k scaling during early steps.
+  - `auto_tune_steps`: number of steps to search (default 1).
+  - `auto_tune_candidates`: candidates per step (default 8).
+  - `auto_tune_quality_samples`: samples per candidate for scoring (default 4).
+  - `auto_tune_seed`: RNG seed for reproducible candidate selection (default 0).
+  - `auto_tune_qk_norm_power_min/max`, `auto_tune_qk_norm_clip_min/max`, `auto_tune_scale_mul_min/max`: search ranges.
+  - `auto_tune_max_tokens`: token cap during tuning (default 512).
   - `quality_check`: sampled softmax vs Taylor comparison is always computed against unmodified attention.
   - `quality_check_samples`: number of sampled queries per call (default 16).
   - `quality_check_log_every`: log every N Taylor calls (default 1).
