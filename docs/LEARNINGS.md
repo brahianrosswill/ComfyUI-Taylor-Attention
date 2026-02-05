@@ -15,3 +15,4 @@
 - Step logs now include q/k norm and sampled q·k percentile diagnostics to measure regime mismatch.
 - Added a Triton fused-kernel path that streams Taylor feature chunks to avoid full feature tensor allocation.
 - Early-probe fallbacks now respect denom_fallback_frac_limit and log probe stats for debugging.
+- Step stats now surface fallback reasons and max_head_dim for easier triage.

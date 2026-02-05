@@ -117,6 +117,7 @@ def _config_summary(cfg: TaylorAttentionConfig) -> Dict[str, Any]:
         "qk_norm_clip": cfg.qk_norm_clip,
         "scale_mul": cfg.scale_mul,
         "sub_head_blocks": cfg.sub_head_blocks,
+        "max_head_dim": cfg.max_head_dim,
         "force_fp32": cfg.force_fp32,
         "denom_fp32": cfg.denom_fp32,
         "probe_samples": cfg.probe_samples,
@@ -464,14 +465,16 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
 
     logger.info(
         "Taylor step stats: sigma=%s calls=%s taylor=%s fallback=%s denom_fallback_frac=%.6g "
+        "reasons=%s "
         "den[min=%.6g max=%.6g mean=%.6g frac_le_eps=%.6g] "
         "quality[mean_abs=%.6g max_abs=%.6g mean_rel=%.6g max_rel=%.6g samples=%s] "
-        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s force_fp32=%s denom_fp32=%s probe_samples=%s denom_fallback_frac_limit=%.3g fused_kernel=%s fused_feature_chunk_size=%s]%s",
+        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s max_head_dim=%s force_fp32=%s denom_fp32=%s probe_samples=%s denom_fallback_frac_limit=%.3g fused_kernel=%s fused_feature_chunk_size=%s]%s",
         sigma,
         calls,
         step_stats["taylor_calls"],
         step_stats["fallback_calls"],
         denom_frac,
+        step_stats["fallback_reasons"],
         den_min,
         den_max,
         den_mean,
@@ -486,6 +489,7 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
         cfg_summary["qk_norm_clip"],
         cfg_summary["scale_mul"],
         cfg_summary["sub_head_blocks"],
+        cfg_summary["max_head_dim"],
         cfg_summary["force_fp32"],
         cfg_summary["denom_fp32"],
         cfg_summary["probe_samples"],
