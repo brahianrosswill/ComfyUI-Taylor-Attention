@@ -19,6 +19,7 @@ designed for large token counts where quadratic attention becomes expensive.
   - `P`: number of Taylor terms (default 4).
   - `min_tokens`: only use Taylor when tokens >= this threshold (default 10000).
   - `max_feature_dim_R`: safety cap for feature dimension.
+  - `sub_head_blocks`: split each head into smaller blocks to reduce feature expansion (approximate).
   - `block_size_q` / `block_size_k`: block sizes for memory control.
   - `fallback_on_negative`: fallback to standard attention if denominators are too small.
   - `force_fp32`: accumulate Taylor features in fp32 for stability (disable to reduce memory).

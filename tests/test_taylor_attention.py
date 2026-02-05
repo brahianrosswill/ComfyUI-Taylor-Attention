@@ -204,6 +204,83 @@ def test_probe_config_respected():
     assert cfg.denom_fp32 is True
 
 
+def test_sub_head_blocks_config_respected():
+    cfg = taylor_attention._resolve_config({"enabled": True, "sub_head_blocks": 3})
+    assert cfg.sub_head_blocks == 3
+
+
+def test_sub_head_blocks_output_shape():
+    device = torch.device("cpu")
+    batch = 1
+    heads = 2
+    tokens = 64
+    dim_head = 32
+
+    q, k, v = _make_qkv(batch, heads, tokens, dim_head, device)
+
+    config = {
+        "enabled": True,
+        "P": 3,
+        "min_tokens": 0,
+        "max_feature_dim_R": 200000,
+        "block_size_q": 32,
+        "block_size_k": 32,
+        "eps": 1e-6,
+        "fallback_on_negative": False,
+        "allow_cross_attention": True,
+        "max_head_dim": 128,
+        "sub_head_blocks": 2,
+    }
+
+    out = taylor_attention.taylor_attention(
+        q,
+        k,
+        v,
+        heads,
+        skip_reshape=True,
+        skip_output_reshape=True,
+        config=config,
+    )
+
+    assert out.shape == (batch, heads, tokens, dim_head)
+
+
+def test_sub_head_blocks_mismatch_fallback():
+    device = torch.device("cpu")
+    batch = 1
+    heads = 2
+    tokens = 16
+    dim_head = 30
+
+    q, k, v = _make_qkv(batch, heads, tokens, dim_head, device)
+
+    config = {
+        "enabled": True,
+        "P": 3,
+        "min_tokens": 0,
+        "max_feature_dim_R": 200000,
+        "block_size_q": 16,
+        "block_size_k": 16,
+        "eps": 1e-6,
+        "fallback_on_negative": False,
+        "allow_cross_attention": True,
+        "max_head_dim": 128,
+        "sub_head_blocks": 4,
+    }
+
+    with pytest.raises(taylor_attention.TaylorAttentionFallback) as exc:
+        taylor_attention.taylor_attention(
+            q,
+            k,
+            v,
+            heads,
+            skip_reshape=True,
+            config=config,
+        )
+
+    assert exc.value.reason == "sub_head_block_mismatch"
+
+
 def test_quality_check_logs(caplog):
     device = torch.device("cpu")
     batch = 1

@@ -33,6 +33,7 @@ class TaylorAttentionConfig:
     fallback_on_negative: bool = True
     allow_cross_attention: bool = True
     max_head_dim: int = 128
+    sub_head_blocks: int = 1
     force_fp32: bool = True
     memory_reserve: bool = True
     memory_reserve_factor: float = 1.1
@@ -88,6 +89,12 @@ def _resolve_config(config: Optional[Dict[str, Any]]) -> TaylorAttentionConfig:
         if hasattr(cfg, key):
             setattr(cfg, key, value)
     return cfg
+
+
+def _clone_config(config: Optional[Dict[str, Any]], cfg: TaylorAttentionConfig) -> Dict[str, Any]:
+    if isinstance(config, dict):
+        return dict(config)
+    return cfg.__dict__.copy()
 
 
 def _quality_check_should_log(cfg: TaylorAttentionConfig) -> bool:
@@ -386,6 +393,55 @@ def taylor_attention(
         raise TaylorAttentionFallback("below_min_tokens")
 
     dim_head = q.shape[-1]
+    sub_head_blocks = max(1, cfg.sub_head_blocks)
+    if sub_head_blocks > 1:
+        if dim_head % sub_head_blocks != 0:
+            raise TaylorAttentionFallback("sub_head_block_mismatch")
+        block_dim = dim_head // sub_head_blocks
+        if block_dim > cfg.max_head_dim:
+            raise TaylorAttentionFallback("head_dim_too_large")
+
+        feature_dim = taylor_sym_features.feature_dim(block_dim, cfg.P)
+        if feature_dim > cfg.max_feature_dim_R:
+            if cfg.log_fallbacks:
+                logger.warning(
+                    "Taylor attention fallback: feature_dim_too_large (R=%s > max_feature_dim_R=%s) head_dim=%s block_dim=%s sub_head_blocks=%s P=%s",
+                    feature_dim,
+                    cfg.max_feature_dim_R,
+                    dim_head,
+                    block_dim,
+                    sub_head_blocks,
+                    cfg.P,
+                )
+            raise TaylorAttentionFallback("feature_dim_too_large")
+
+        sub_config = _clone_config(config, cfg)
+        sub_config["sub_head_blocks"] = 1
+        sub_outputs = []
+        for block_idx in range(sub_head_blocks):
+            start = block_idx * block_dim
+            end = start + block_dim
+            sub_outputs.append(
+                taylor_attention(
+                    q[..., start:end],
+                    k[..., start:end],
+                    v[..., start:end],
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=True,
+                    skip_output_reshape=True,
+                    config=sub_config,
+                    transformer_options=transformer_options,
+                    **kwargs,
+                )
+            )
+        out = torch.cat(sub_outputs, dim=-1)
+        if skip_output_reshape:
+            return out
+        out = out.permute(0, 2, 1, 3).reshape(batch, n_q, heads * dim_head)
+        return out
+
     if dim_head > cfg.max_head_dim:
         raise TaylorAttentionFallback("head_dim_too_large")
 

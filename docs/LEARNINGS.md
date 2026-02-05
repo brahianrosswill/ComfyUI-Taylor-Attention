@@ -4,3 +4,4 @@
 - Flux attention calls `optimized_attention(..., skip_reshape=True)` with `q/k/v` shaped `[B, H, N, D]` after RoPE, so backend overrides should handle that layout.
 - Taylor attention now estimates its own activation memory and calls ComfyUI's `model_management.free_memory` to prompt offloading before large allocations.
 - Early-probe and fp32 denominator options help avoid slow Taylor fallbacks when denominators go unstable.
+- Sub-head block Taylor splits each head into smaller blocks to reduce feature dimension while keeping P fixed.
