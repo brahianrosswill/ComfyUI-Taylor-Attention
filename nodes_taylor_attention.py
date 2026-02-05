@@ -352,8 +352,8 @@ class TaylorAttentionBackend(io.ComfyNode):
 
 class HybridTaylorAttentionBackend(io.ComfyNode):
     @classmethod
-    def define(cls) -> io.NodeDef:
-        return io.NodeDef(
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
             node_id="HybridTaylorAttentionBackend",
             display_name="Hybrid Taylor Attention Backend",
             category="advanced/attention",
