@@ -14,3 +14,4 @@
 - Auto-tune mode can search q/k scaling during early steps and lock in a best config.
 - Step logs now include q/k norm and sampled q·k percentile diagnostics to measure regime mismatch.
 - Added a Triton fused-kernel path that streams Taylor feature chunks to avoid full feature tensor allocation.
+- Early-probe fallbacks now respect denom_fallback_frac_limit and log probe stats for debugging.

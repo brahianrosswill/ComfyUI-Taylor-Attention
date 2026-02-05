@@ -679,8 +679,18 @@ def _probe_denominators(
 
     if torch.isnan(den).any() or torch.isinf(den).any():
         raise TaylorAttentionFallback("denominator_invalid")
-    if cfg.fallback_on_negative and torch.any(den <= eps):
-        raise TaylorAttentionFallback("denominator_too_small")
+    probe_stats = _init_den_stats()
+    _accum_den_stats(probe_stats, den, eps)
+    _log_den_stats(probe_stats, prefix="Taylor denominator stats (probe)")
+    if cfg.fallback_on_negative:
+        den_le = probe_stats["le_eps"]
+        if cfg.denom_fallback_frac_limit > 0:
+            den_frac = den_le / probe_stats["count"] if probe_stats["count"] > 0 else 1.0
+            if den_frac > cfg.denom_fallback_frac_limit:
+                raise TaylorAttentionFallback("denominator_too_small")
+        else:
+            if den_le > 0:
+                raise TaylorAttentionFallback("denominator_too_small")
 
 
 
@@ -981,8 +991,18 @@ def _taylor_attention_fused(
     if den_probe is not None:
         if torch.isnan(den_probe).any() or torch.isinf(den_probe).any():
             raise TaylorAttentionFallback("denominator_invalid")
-        if cfg.fallback_on_negative and torch.any(den_probe <= cfg.eps):
-            raise TaylorAttentionFallback("denominator_too_small")
+        probe_stats = _init_den_stats()
+        _accum_den_stats(probe_stats, den_probe, cfg.eps)
+        _log_den_stats(probe_stats, prefix="Taylor denominator stats (probe)")
+        if cfg.fallback_on_negative:
+            den_le = probe_stats["le_eps"]
+            if cfg.denom_fallback_frac_limit > 0:
+                den_frac = den_le / probe_stats["count"] if probe_stats["count"] > 0 else 1.0
+                if den_frac > cfg.denom_fallback_frac_limit:
+                    raise TaylorAttentionFallback("denominator_too_small")
+            else:
+                if den_le > 0:
+                    raise TaylorAttentionFallback("denominator_too_small")
 
     den_stats = _init_den_stats()
     _accum_den_stats(den_stats, den, cfg.eps)
