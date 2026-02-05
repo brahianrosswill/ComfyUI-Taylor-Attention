@@ -19,3 +19,4 @@
 - Added fused value-dimension chunking and bf16 S-chunk storage to reduce memory in fused path.
 - Step stats now log both quality_raw (unmodified) and quality_eff (modified) metrics.
 - Feature-dimension fallback logs now always include the rejected R value.
+- max_feature_dim_R UI limit raised to allow very large feature dimensions when experimenting with higher P.

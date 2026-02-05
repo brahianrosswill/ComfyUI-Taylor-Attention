@@ -118,7 +118,7 @@ class TaylorAttentionBackend(io.ComfyNode):
                 io.Combo.Input("backend", options=["standard", "taylor"], default="taylor"),
                 io.Int.Input("P", default=4, min=1, max=8, step=1, tooltip="Number of Taylor terms."),
                 io.Int.Input("min_tokens", default=100, min=0, max=200000, step=1, tooltip="Enable Taylor only when tokens >= min_tokens."),
-                io.Int.Input("max_feature_dim_R", default=370000, min=1, max=10000000, step=1, tooltip="Safety cap for feature dimension R."),
+                io.Int.Input("max_feature_dim_R", default=370000, min=1, max=1000000000, step=1, tooltip="Safety cap for feature dimension R."),
                 io.Int.Input("block_size_q", default=32, min=1, max=8192, step=1),
                 io.Int.Input("block_size_k", default=16, min=1, max=8192, step=1),
                 io.Float.Input("eps", default=1e-6, min=1e-12, max=1e-2, step=1e-6),
