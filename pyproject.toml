@@ -19,4 +19,4 @@ test = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --ignore=__init__.py"
