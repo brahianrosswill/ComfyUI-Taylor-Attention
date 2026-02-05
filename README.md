@@ -23,6 +23,7 @@ designed for large token counts where quadratic attention becomes expensive.
   - `qk_normalize`: L2-normalize queries/keys before Taylor features (default false).
   - `qk_norm_clip`: clip L2 norm of queries/keys (default 0, disables).
   - `qk_norm_power`: soften q/k magnitude by dividing by ||q||^power (default 0, disables).
+  - `qk_norm_sigma_max`: only apply q/k normalization when sigma <= this value (default 0, disabled).
   - `scale_mul`: additional scale multiplier for q·k before Taylor (default 1.0).
   - `block_size_q` / `block_size_k`: block sizes for memory control (defaults 32 / 16).
   - `fallback_on_negative`: fallback to standard attention if denominators are too small.

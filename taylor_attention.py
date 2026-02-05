@@ -42,6 +42,7 @@ class TaylorAttentionConfig:
     qk_normalize: bool = False
     qk_norm_clip: float = 0.0
     qk_norm_power: float = 0.0
+    qk_norm_sigma_max: float = 0.0
     scale_mul: float = 1.0
     force_fp32: bool = False
     memory_reserve: bool = True
@@ -117,6 +118,7 @@ def _config_summary(cfg: TaylorAttentionConfig) -> Dict[str, Any]:
         "qk_normalize": cfg.qk_normalize,
         "qk_norm_power": cfg.qk_norm_power,
         "qk_norm_clip": cfg.qk_norm_clip,
+        "qk_norm_sigma_max": cfg.qk_norm_sigma_max,
         "scale_mul": cfg.scale_mul,
         "sub_head_blocks": cfg.sub_head_blocks,
         "max_head_dim": cfg.max_head_dim,
@@ -394,6 +396,20 @@ def _should_log_step(transformer_options: Optional[dict]) -> bool:
     return False
 
 
+def _get_sigma(transformer_options: Optional[dict]) -> Optional[float]:
+    if transformer_options is None:
+        return None
+    sigmas = transformer_options.get("sigmas")
+    if isinstance(sigmas, torch.Tensor) and sigmas.numel() > 0:
+        return float(sigmas.flatten()[0].item())
+    if sigmas is not None:
+        try:
+            return float(sigmas)
+        except Exception:
+            return None
+    return None
+
+
 def _maybe_add_diagnostics(
     step_stats: Optional[Dict[str, Any]],
     transformer_options: Optional[dict],
@@ -448,16 +464,7 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
     calls = step_stats["calls"]
     denom_frac = (step_stats["denom_fallbacks"] / calls) if calls > 0 else 0.0
 
-    sigma = None
-    if transformer_options is not None:
-        sigmas = transformer_options.get("sigmas")
-        if isinstance(sigmas, torch.Tensor) and sigmas.numel() > 0:
-            sigma = float(sigmas.flatten()[0].item())
-        elif sigmas is not None:
-            try:
-                sigma = float(sigmas)
-            except Exception:
-                sigma = None
+    sigma = _get_sigma(transformer_options)
 
     cfg_summary = step_stats["config"]
 
@@ -478,7 +485,7 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
         "den[min=%.6g max=%.6g mean=%.6g frac_le_eps=%.6g] "
         "quality[mean_abs=%.6g max_abs=%.6g mean_rel=%.6g max_rel=%.6g samples=%s] "
         "quality_raw[%s] quality_eff[%s] "
-        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s max_head_dim=%s force_fp32=%s denom_fp32=%s probe_samples=%s denom_fallback_frac_limit=%.3g fused_kernel=%s fused_feature_chunk_size=%s fused_value_chunk_size=%s s_store_bf16=%s]%s",
+        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g qk_norm_sigma_max=%.3g scale_mul=%.3g sub_head_blocks=%s max_head_dim=%s force_fp32=%s denom_fp32=%s probe_samples=%s denom_fallback_frac_limit=%.3g fused_kernel=%s fused_feature_chunk_size=%s fused_value_chunk_size=%s s_store_bf16=%s]%s",
         sigma,
         calls,
         step_stats["taylor_calls"],
@@ -499,6 +506,7 @@ def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttent
         cfg_summary["qk_normalize"],
         cfg_summary["qk_norm_power"],
         cfg_summary["qk_norm_clip"],
+        cfg_summary["qk_norm_sigma_max"],
         cfg_summary["scale_mul"],
         cfg_summary["sub_head_blocks"],
         cfg_summary["max_head_dim"],
@@ -569,7 +577,11 @@ def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
     dtype_accum: torch.dtype,
+    sigma: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if cfg.qk_norm_sigma_max > 0:
+        if sigma is None or sigma > cfg.qk_norm_sigma_max:
+            return q, k
     if not (cfg.qk_normalize or cfg.qk_norm_clip > 0 or cfg.qk_norm_power > 0):
         return q, k
     q_f = q.to(dtype=dtype_accum)
@@ -1243,7 +1255,7 @@ def taylor_attention(
             )
         out = torch.cat(sub_outputs, dim=-1)
         if step_stats is not None:
-            q_eff, k_eff = _apply_qk_norm(cfg, q_orig, k_orig, dtype_accum=torch.float32)
+            q_eff, k_eff = _apply_qk_norm(cfg, q_orig, k_orig, dtype_accum=torch.float32, sigma=_get_sigma(transformer_options))
             quality_raw = _compute_quality_stats(cfg, q_orig, k_orig, v, out, key_mask_bool, scale_base)
             quality_eff = _compute_quality_stats(cfg, q_eff, k_eff, v, out, key_mask_bool, scale)
             _merge_quality_stats(step_stats["quality"], quality_raw)
@@ -1272,7 +1284,7 @@ def taylor_attention(
 
     dtype_accum = torch.float32 if cfg.force_fp32 else q.dtype
     v_dtype = v.dtype
-    q, k = _apply_qk_norm(cfg, q, k, dtype_accum)
+    q, k = _apply_qk_norm(cfg, q, k, dtype_accum, sigma=_get_sigma(transformer_options))
 
     if cfg.fused_kernel and sub_head_blocks == 1:
         return _taylor_attention_fused(
