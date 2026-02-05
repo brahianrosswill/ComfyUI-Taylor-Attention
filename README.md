@@ -35,6 +35,21 @@ designed for large token counts where quadratic attention becomes expensive.
 
 When enabled, the node injects `optimized_attention_override` into `transformer_options`, so Flux attention calls will route through the Taylor backend and fall back if unsupported masks or stability issues are detected.
 
+## Performance Optimizations
+
+Diffusion transformers (Flux/Flux2) run at very different scales than LLMs (large spatial token counts, fixed head dims), so Taylor attention can blow past `max_feature_dim_R` even for modest `P`. The `sub_head_blocks` option is the main way to keep Taylor feasible at these scales.
+
+- `sub_head_blocks` splits each attention head into smaller blocks and runs Taylor on each block independently.
+  - This reduces the feature expansion size `R` dramatically while keeping `P` fixed.
+  - It is an approximation: more blocks = less accuracy, but much lower VRAM and faster compute.
+- Rule of thumb: pick the smallest `sub_head_blocks` that makes `feature_dim(block_dim, P) <= max_feature_dim_R` where `block_dim = head_dim / sub_head_blocks`.
+
+Example (Flux head_dim=128, P=4, max_feature_dim_R=60000):
+- sub_head_blocks=4 -> block_dim=32 -> R=52,360 (fits)
+- sub_head_blocks=8 -> block_dim=16 -> R=3,876 (very safe, more approximate)
+
+Start with `sub_head_blocks=4` for Flux/Flux2 and only increase if you still hit `feature_dim_too_large` or VRAM pressure. Use `quality_check` to sample accuracy when you change this.
+
 ## Tests
 
 ```bash
