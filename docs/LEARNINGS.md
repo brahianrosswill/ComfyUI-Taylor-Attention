@@ -22,3 +22,4 @@
 - max_feature_dim_R UI limit raised to allow very large feature dimensions when experimenting with higher P.
 - For P>=5, the fused path streams multiset feature indices on GPU to avoid Python tuple construction overhead.
 - Added qk_norm_sigma_max to gate q/k normalization by sigma.
+- Streaming fused memory reservation now estimates based on chunk sizes to avoid over-offloading.

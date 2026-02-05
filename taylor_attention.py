@@ -684,6 +684,7 @@ def _maybe_reserve_memory(
     transformer_options: Optional[dict],
     dtype_accum: torch.dtype,
     m_max_override: Optional[int] = None,
+    d_val_override: Optional[int] = None,
 ) -> None:
     if not cfg.memory_reserve:
         return
@@ -692,7 +693,7 @@ def _maybe_reserve_memory(
     if q.device.type == "cpu":
         return
     batch, heads, n_q, _ = q.shape
-    d_val = v.shape[-1]
+    d_val = d_val_override if d_val_override is not None else v.shape[-1]
     if m_max_override is not None:
         m_max = m_max_override
     else:
@@ -1006,7 +1007,21 @@ def _taylor_attention_fused(
         for p in range(cfg.P):
             max_r = max(max_r, math.comb(dim_head + p - 1, p))
         m_max = min(chunk_size, max_r)
-        _maybe_reserve_memory(cfg, q, v, feature_dim, (), block_q, block_k, transformer_options, dtype_accum, m_max_override=m_max)
+        feature_dim_eff = min(feature_dim, chunk_size)
+        d_val_eff = min(v.shape[-1], value_chunk)
+        _maybe_reserve_memory(
+            cfg,
+            q,
+            v,
+            feature_dim_eff,
+            (),
+            block_q,
+            block_k,
+            transformer_options,
+            dtype_accum,
+            m_max_override=m_max,
+            d_val_override=d_val_eff,
+        )
         spec_iter = taylor_sym_features.iter_feature_specs_streaming(dim_head, cfg.P, q.device, chunk_size)
     else:
         specs = taylor_sym_features.get_feature_specs(dim_head, cfg.P, q.device)
