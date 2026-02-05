@@ -390,6 +390,13 @@ def test_denominator_stats_logs(caplog):
         "early_probe": False,
     }
 
+    transformer_options = {
+        "block_type": "single",
+        "block_index": 0,
+        "total_blocks": 1,
+        "sigmas": torch.tensor([1.0]),
+    }
+
     caplog.set_level(logging.INFO, logger="taylor_attention")
     taylor_attention.taylor_attention(
         q,
@@ -398,9 +405,10 @@ def test_denominator_stats_logs(caplog):
         heads,
         skip_reshape=True,
         config=config,
+        transformer_options=transformer_options,
     )
 
-    assert "Taylor denominator stats" in caplog.text
+    assert "Taylor step stats" in caplog.text
 
 
 def test_quality_check_logs(caplog):
@@ -428,6 +436,13 @@ def test_quality_check_logs(caplog):
         "quality_check_log_every": 1,
     }
 
+    transformer_options = {
+        "block_type": "single",
+        "block_index": 0,
+        "total_blocks": 1,
+        "sigmas": torch.tensor([1.0]),
+    }
+
     caplog.set_level(logging.INFO, logger="taylor_attention")
     taylor_attention.taylor_attention(
         q,
@@ -436,6 +451,7 @@ def test_quality_check_logs(caplog):
         heads,
         skip_reshape=True,
         config=config,
+        transformer_options=transformer_options,
     )
 
-    assert "Taylor quality check" in caplog.text
+    assert "Taylor step stats" in caplog.text

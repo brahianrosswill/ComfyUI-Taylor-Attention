@@ -61,6 +61,160 @@ _GLOBAL_STATS: Dict[str, Any] = {
 }
 _QUALITY_CHECK_CALLS = 0
 
+def _init_quality_stats() -> Dict[str, float]:
+    return {"sum_abs": 0.0, "sum_rel": 0.0, "max_abs": 0.0, "max_rel": 0.0, "samples": 0}
+
+
+def _merge_quality_stats(dst: Dict[str, float], src: Optional[Dict[str, float]]) -> None:
+    if not src:
+        return
+    dst["sum_abs"] += src["sum_abs"]
+    dst["sum_rel"] += src["sum_rel"]
+    dst["samples"] += src["samples"]
+    if src["max_abs"] > dst["max_abs"]:
+        dst["max_abs"] = src["max_abs"]
+    if src["max_rel"] > dst["max_rel"]:
+        dst["max_rel"] = src["max_rel"]
+
+
+def _merge_den_stats(dst: Dict[str, float], src: Dict[str, float]) -> None:
+    if src["count"] <= 0:
+        return
+    if dst["min"] is None or src["min"] < dst["min"]:
+        dst["min"] = src["min"]
+    if dst["max"] is None or src["max"] > dst["max"]:
+        dst["max"] = src["max"]
+    dst["sum"] += src["sum"]
+    dst["count"] += src["count"]
+    dst["le_eps"] += src["le_eps"]
+    dst["blocks"] += src["blocks"]
+
+
+def _config_summary(cfg: TaylorAttentionConfig) -> Dict[str, Any]:
+    return {
+        "qk_normalize": cfg.qk_normalize,
+        "qk_norm_power": cfg.qk_norm_power,
+        "qk_norm_clip": cfg.qk_norm_clip,
+        "scale_mul": cfg.scale_mul,
+        "sub_head_blocks": cfg.sub_head_blocks,
+        "force_fp32": cfg.force_fp32,
+        "denom_fp32": cfg.denom_fp32,
+        "probe_samples": cfg.probe_samples,
+    }
+
+
+def _get_step_stats(transformer_options: Optional[dict], cfg: TaylorAttentionConfig) -> Optional[Dict[str, Any]]:
+    if transformer_options is None:
+        return None
+    stats = transformer_options.get("taylor_step_stats")
+    if stats is None:
+        stats = {
+            "calls": 0,
+            "taylor_calls": 0,
+            "fallback_calls": 0,
+            "denom_fallbacks": 0,
+            "fallback_reasons": {},
+            "den_stats": _init_den_stats(),
+            "quality": _init_quality_stats(),
+            "config": _config_summary(cfg),
+        }
+        transformer_options["taylor_step_stats"] = stats
+    return stats
+
+
+def _should_log_step(transformer_options: Optional[dict]) -> bool:
+    if transformer_options is None:
+        return True
+    if transformer_options.get("taylor_step_logged"):
+        return False
+    block_type = transformer_options.get("block_type")
+    total_blocks = transformer_options.get("total_blocks")
+    block_index = transformer_options.get("block_index")
+    if block_type == "single" and isinstance(total_blocks, int) and isinstance(block_index, int):
+        return block_index == total_blocks - 1
+    return False
+
+
+def _maybe_log_step_stats(transformer_options: Optional[dict], cfg: TaylorAttentionConfig, step_stats: Optional[Dict[str, Any]] = None) -> None:
+    if step_stats is None:
+        step_stats = _get_step_stats(transformer_options, cfg)
+    if step_stats is None:
+        return
+    if not _should_log_step(transformer_options):
+        return
+
+    den_stats = step_stats["den_stats"]
+    if den_stats["count"] > 0:
+        den_mean = den_stats["sum"] / den_stats["count"]
+        den_frac = den_stats["le_eps"] / den_stats["count"]
+        den_min = den_stats["min"]
+        den_max = den_stats["max"]
+    else:
+        den_mean = float("nan")
+        den_frac = float("nan")
+        den_min = float("nan")
+        den_max = float("nan")
+
+    quality = step_stats["quality"]
+    if quality["samples"] > 0:
+        q_mean_abs = quality["sum_abs"] / quality["samples"]
+        q_mean_rel = quality["sum_rel"] / quality["samples"]
+        q_max_abs = quality["max_abs"]
+        q_max_rel = quality["max_rel"]
+    else:
+        q_mean_abs = float("nan")
+        q_mean_rel = float("nan")
+        q_max_abs = float("nan")
+        q_max_rel = float("nan")
+
+    calls = step_stats["calls"]
+    denom_frac = (step_stats["denom_fallbacks"] / calls) if calls > 0 else 0.0
+
+    sigma = None
+    if transformer_options is not None:
+        sigmas = transformer_options.get("sigmas")
+        if isinstance(sigmas, torch.Tensor) and sigmas.numel() > 0:
+            sigma = float(sigmas.flatten()[0].item())
+        elif sigmas is not None:
+            try:
+                sigma = float(sigmas)
+            except Exception:
+                sigma = None
+
+    cfg_summary = step_stats["config"]
+
+    logger.info(
+        "Taylor step stats: sigma=%s calls=%s taylor=%s fallback=%s denom_fallback_frac=%.6g "
+        "den[min=%.6g max=%.6g mean=%.6g frac_le_eps=%.6g] "
+        "quality[mean_abs=%.6g max_abs=%.6g mean_rel=%.6g max_rel=%.6g samples=%s] "
+        "config[qk_normalize=%s qk_norm_power=%.3g qk_norm_clip=%.3g scale_mul=%.3g sub_head_blocks=%s force_fp32=%s denom_fp32=%s probe_samples=%s]",
+        sigma,
+        calls,
+        step_stats["taylor_calls"],
+        step_stats["fallback_calls"],
+        denom_frac,
+        den_min,
+        den_max,
+        den_mean,
+        den_frac,
+        q_mean_abs,
+        q_max_abs,
+        q_mean_rel,
+        q_max_rel,
+        quality["samples"],
+        cfg_summary["qk_normalize"],
+        cfg_summary["qk_norm_power"],
+        cfg_summary["qk_norm_clip"],
+        cfg_summary["scale_mul"],
+        cfg_summary["sub_head_blocks"],
+        cfg_summary["force_fp32"],
+        cfg_summary["denom_fp32"],
+        cfg_summary["probe_samples"],
+    )
+
+    if transformer_options is not None:
+        transformer_options["taylor_step_logged"] = True
+        transformer_options.pop("taylor_step_stats", None)
 
 def _update_stats(reason: Optional[str] = None, used_taylor: bool = False) -> None:
     _GLOBAL_STATS["calls"] += 1
@@ -109,7 +263,7 @@ def _quality_check_should_log(cfg: TaylorAttentionConfig) -> bool:
     return (_QUALITY_CHECK_CALLS % cfg.quality_check_log_every) == 0
 
 
-def _run_quality_check(
+def _compute_quality_stats(
     cfg: TaylorAttentionConfig,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -117,17 +271,16 @@ def _run_quality_check(
     out: torch.Tensor,
     key_mask_bool: Optional[torch.Tensor],
     scale: float,
-) -> None:
+) -> Optional[Dict[str, float]]:
     if not cfg.quality_check:
-        return
+        return None
     if not _quality_check_should_log(cfg):
-        return
+        return None
 
     batch, heads, n_q, dim_head = q.shape
-    n_k = k.shape[2]
     samples = min(cfg.quality_check_samples, n_q)
     if samples <= 0:
-        return
+        return None
 
     idx = torch.randperm(n_q, device=q.device)[:samples]
     q_s = q[:, :, idx, :].float()
@@ -144,17 +297,15 @@ def _run_quality_check(
 
     approx = out[:, :, idx, :].float()
     diff = (approx - exact).abs()
-    mean_abs = diff.mean().item()
-    max_abs = diff.max().item()
-    mean_rel = (diff / (exact.abs() + 1e-6)).mean().item()
+    rel = diff / (exact.abs() + 1e-6)
 
-    logger.info(
-        "Taylor quality check: samples=%s mean_abs=%.6f max_abs=%.6f mean_rel=%.6f",
-        samples,
-        mean_abs,
-        max_abs,
-        mean_rel,
-    )
+    return {
+        "sum_abs": float(diff.sum().item()),
+        "sum_rel": float(rel.sum().item()),
+        "max_abs": float(diff.max().item()),
+        "max_rel": float(rel.max().item()),
+        "samples": int(diff.numel()),
+    }
 
 
 
@@ -247,10 +398,6 @@ def _probe_denominators(
         else:
             den += torch.einsum("b h n r, b h r -> b h n", psi_q, z_slice)
         offset += m_p
-
-    probe_stats = _init_den_stats()
-    _accum_den_stats(probe_stats, den, eps)
-    _log_den_stats(probe_stats, prefix="Taylor denominator stats (probe)")
 
     if torch.isnan(den).any() or torch.isinf(den).any():
         raise TaylorAttentionFallback("denominator_invalid")
@@ -431,6 +578,8 @@ def taylor_attention(
     cfg = _resolve_config(config)
     if not cfg.enabled:
         raise TaylorAttentionFallback("disabled")
+
+    step_stats = _get_step_stats(transformer_options, cfg)
 
     q, k, v, batch, heads, n_q, n_k = _reshape_inputs(q, k, v, heads, skip_reshape)
 
@@ -634,19 +783,24 @@ def taylor_attention(
         _accum_den_stats(den_stats, den, cfg.eps)
 
         if torch.isnan(den).any() or torch.isinf(den).any():
-            _log_den_stats(den_stats, prefix="Taylor denominator stats (partial)")
+            if step_stats is not None:
+                _merge_den_stats(step_stats["den_stats"], den_stats)
             raise TaylorAttentionFallback("denominator_invalid")
         if cfg.fallback_on_negative and torch.any(den <= cfg.eps):
-            _log_den_stats(den_stats, prefix="Taylor denominator stats (partial)")
+            if step_stats is not None:
+                _merge_den_stats(step_stats["den_stats"], den_stats)
             raise TaylorAttentionFallback("denominator_too_small")
         den = torch.clamp(den, min=cfg.eps)
         if den.dtype != dtype_accum:
             den = den.to(dtype_accum)
         out[:, :, start:end, :] = num / den[..., None]
 
-    _log_den_stats(den_stats)
-
-    _run_quality_check(cfg, q, k, v, out, key_mask_bool, scale)
+    quality_stats = _compute_quality_stats(cfg, q, k, v, out, key_mask_bool, scale)
+    if step_stats is not None:
+        step_stats["taylor_calls"] += 1
+        _merge_den_stats(step_stats["den_stats"], den_stats)
+        _merge_quality_stats(step_stats["quality"], quality_stats)
+        _maybe_log_step_stats(transformer_options, cfg, step_stats)
 
     out = out.to(dtype=v_dtype)
     if skip_output_reshape:
@@ -666,6 +820,10 @@ def taylor_attention_override(original_func, *args, **kwargs):
         _update_stats()
         return original_func(*args, **kwargs)
 
+    step_stats = _get_step_stats(transformer_options, cfg)
+    if step_stats is not None:
+        step_stats["calls"] += 1
+
     try:
         out = taylor_attention(*args, config=config_dict, **kwargs)
         _update_stats(used_taylor=True)
@@ -674,6 +832,13 @@ def taylor_attention_override(original_func, *args, **kwargs):
     except TaylorAttentionFallback as exc:
         _update_stats(reason=exc.reason)
         _maybe_log_stats(cfg)
+        if step_stats is not None:
+            step_stats["fallback_calls"] += 1
+            reasons = step_stats["fallback_reasons"]
+            reasons[exc.reason] = reasons.get(exc.reason, 0) + 1
+            if exc.reason == "denominator_too_small":
+                step_stats["denom_fallbacks"] += 1
+        _maybe_log_step_stats(transformer_options, cfg, step_stats)
         if cfg.log_fallbacks:
             logger.warning("Taylor attention fallback: %s", exc.reason)
         return original_func(*args, **kwargs)
