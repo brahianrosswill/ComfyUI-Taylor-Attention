@@ -269,7 +269,10 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
 
     if local_out.ndim == 3:
         global_out = global_out.permute(0, 2, 1, 3).reshape(local_out.shape[0], local_out.shape[1], -1)
-    out = local_out + global_weight * global_out
+    if global_out.dtype != local_out.dtype:
+        global_out = global_out.to(dtype=local_out.dtype)
+    weight = torch.tensor(global_weight, dtype=local_out.dtype, device=local_out.device)
+    out = local_out + weight * global_out
     if cfg.log_steps:
         logger.info(
             "Hybrid attention: sigma=%s local_window=%s global_dim=%s global_P=%s global_weight=%.3g",
