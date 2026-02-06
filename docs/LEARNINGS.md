@@ -38,3 +38,4 @@
 - Local window scheduling now uses a smoothstep (sigmoid-like) curve for gentler start/end transitions.
 - Hybrid global Taylor now aligns accumulation dtype with force_fp32 to avoid bf16/fp32 einsum mismatches.
 - Hybrid quality stats logs now include the active hybrid config parameters for reproducibility.
+- Hybrid quality stats now append to `output/hybrid-attention-results.jsonl` including config and inferred meta (sigma, shapes, latent resolution where possible).

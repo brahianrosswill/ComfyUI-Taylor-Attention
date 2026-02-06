@@ -84,6 +84,12 @@ def test_format_config_summary_includes_keys():
     assert "force_fp32=True" in summary
 
 
+def test_format_meta_summary():
+    summary = hybrid_attention._format_meta_summary({"sigma": 0.5, "q_len": 1024})
+    assert "sigma=0.5" in summary
+    assert "q_len=1024" in summary
+
+
 def test_pre_run_callback_reads_model_options(monkeypatch):
     called = {"patch": 0}
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,6 +18,7 @@ _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PATCH_DEPTH = 0
 _PCA_CACHE: Dict[Tuple[torch.device, int, int, torch.dtype], torch.Tensor] = {}
 _HYBRID_QUALITY: Dict[str, float] = {"sum_abs": 0.0, "sum_rel": 0.0, "max_abs": 0.0, "max_rel": 0.0, "samples": 0.0, "calls": 0.0}
+_HYBRID_META: Dict[str, Any] = {}
 _QUALITY_SAMPLES = 8
 _CONFIG_LOG_KEYS = (
     "local_window",
@@ -186,6 +190,10 @@ def _reset_quality_stats() -> None:
     _HYBRID_QUALITY["calls"] = 0.0
 
 
+def _reset_meta() -> None:
+    _HYBRID_META.clear()
+
+
 def _merge_quality_stats(diff: torch.Tensor, rel: torch.Tensor) -> None:
     _HYBRID_QUALITY["sum_abs"] += float(diff.sum().item())
     _HYBRID_QUALITY["sum_rel"] += float(rel.sum().item())
@@ -195,23 +203,30 @@ def _merge_quality_stats(diff: torch.Tensor, rel: torch.Tensor) -> None:
     _HYBRID_QUALITY["calls"] += 1.0
 
 
-def _format_quality_summary() -> Optional[str]:
+def _quality_summary_dict() -> Optional[Dict[str, Any]]:
     samples = _HYBRID_QUALITY["samples"]
     if samples <= 0:
         return None
     mean_abs = _HYBRID_QUALITY["sum_abs"] / samples
     mean_rel = _HYBRID_QUALITY["sum_rel"] / samples
+    return {
+        "mean_abs": mean_abs,
+        "max_abs": _HYBRID_QUALITY["max_abs"],
+        "mean_rel": mean_rel,
+        "max_rel": _HYBRID_QUALITY["max_rel"],
+        "samples": int(samples),
+        "calls": int(_HYBRID_QUALITY["calls"]),
+    }
+
+
+def _format_quality_summary() -> Optional[str]:
+    summary = _quality_summary_dict()
+    if not summary:
+        return None
     return (
-        "mean_abs={:.6g} max_abs={:.6g} mean_rel={:.6g} max_rel={:.6g} "
-        "samples={} calls={}"
-    ).format(
-        mean_abs,
-        _HYBRID_QUALITY["max_abs"],
-        mean_rel,
-        _HYBRID_QUALITY["max_rel"],
-        int(samples),
-        int(_HYBRID_QUALITY["calls"]),
-    )
+        "mean_abs={mean_abs:.6g} max_abs={max_abs:.6g} mean_rel={mean_rel:.6g} "
+        "max_rel={max_rel:.6g} samples={samples} calls={calls}"
+    ).format(**summary)
 
 
 def _format_config_summary(cfg: Dict[str, Any]) -> str:
@@ -228,16 +243,102 @@ def _format_config_summary(cfg: Dict[str, Any]) -> str:
     return "config[" + " ".join(parts) + "]"
 
 
+def _format_meta_summary(meta: Dict[str, Any]) -> str:
+    if not meta:
+        return "meta[n/a]"
+    parts = []
+    for key, value in meta.items():
+        if isinstance(value, float):
+            value_str = f"{value:.6g}"
+        else:
+            value_str = str(value)
+        parts.append(f"{key}={value_str}")
+    return "meta[" + " ".join(parts) + "]"
+
+
+def _update_meta(
+    transformer_options: Optional[dict],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sigma: Optional[float],
+    effective_window: int,
+    global_weight: float,
+) -> None:
+    q_len = int(q.shape[2])
+    k_len = int(k.shape[2])
+    heads = int(q.shape[1])
+    head_dim = int(q.shape[3])
+    token_dim = heads * head_dim
+    latent_h = latent_w = None
+    if q_len > 0:
+        root = int(math.isqrt(q_len))
+        if root * root == q_len:
+            latent_h = root
+            latent_w = root
+    meta = {
+        "batch": int(q.shape[0]),
+        "heads": heads,
+        "head_dim": head_dim,
+        "token_dim": token_dim,
+        "q_len": q_len,
+        "k_len": k_len,
+        "is_cross": q_len != k_len,
+        "dtype": str(q.dtype).replace("torch.", ""),
+        "device": str(q.device),
+        "sigma": sigma if sigma is not None else None,
+        "effective_local_window": int(effective_window),
+        "effective_global_weight": float(global_weight),
+    }
+    if latent_h is not None:
+        meta["latent_h"] = latent_h
+        meta["latent_w"] = latent_w
+    if transformer_options is not None:
+        block_index = transformer_options.get("block_index")
+        if isinstance(block_index, int):
+            meta["block_index"] = block_index
+    _HYBRID_META.update(meta)
+
+
+def _append_quality_jsonl(cfg: Dict[str, Any], summary: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    try:
+        import folder_paths
+        output_dir = folder_paths.get_output_directory()
+    except Exception:
+        output_dir = None
+    if not output_dir:
+        logger.warning("Hybrid attention: could not resolve output directory for quality stats.")
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "hybrid-attention-results.jsonl")
+    record = {
+        "timestamp": time.time(),
+        "quality": summary,
+        "config": {key: cfg.get(key) for key in _CONFIG_LOG_KEYS if key in cfg},
+        "meta": meta,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except Exception:
+        logger.exception("Hybrid attention: failed to append quality stats to %s", path)
+
+
 def _maybe_log_quality_stats(
     cfg: HybridAttentionConfig,
+    transformer_options: Optional[dict],
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
     mask: Optional[torch.Tensor],
+    sigma: Optional[float],
+    effective_window: int,
+    global_weight: float,
 ) -> None:
     if not cfg.log_quality_stats:
         return
+    _update_meta(transformer_options, q_rope, k_rope, v, sigma, effective_window, global_weight)
     n_q = q_rope.shape[2]
     if n_q <= 0:
         return
@@ -457,7 +558,7 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
     )
 
     if global_weight <= 0:
-        _maybe_log_quality_stats(cfg, q_rope, k_rope, v, local_out, mask)
+        _maybe_log_quality_stats(cfg, transformer_options, q_rope, k_rope, v, local_out, mask, sigma, effective_window, global_weight)
         if cfg.log_steps:
             logger.info(
                 "Hybrid attention: sigma=%s local_window=%s prefix_tokens=%s global_weight=0 (global skipped)",
@@ -486,7 +587,7 @@ def hybrid_attention(q, k, v, pe, mask=None, transformer_options=None):
         global_out = global_out.to(dtype=local_out.dtype)
     weight = torch.tensor(global_weight, dtype=local_out.dtype, device=local_out.device)
     out = local_out + weight * global_out
-    _maybe_log_quality_stats(cfg, q_rope, k_rope, v, out, mask)
+    _maybe_log_quality_stats(cfg, transformer_options, q_rope, k_rope, v, out, mask, sigma, effective_window, global_weight)
     if cfg.log_steps:
         logger.info(
             "Hybrid attention: sigma=%s local_window=%s prefix_tokens=%s global_dim=%s global_P=%s global_weight=%.3g",
@@ -561,6 +662,14 @@ def pre_run_callback(patcher):
         return
     if cfg.get("log_quality_stats", False):
         _reset_quality_stats()
+        _reset_meta()
+        _HYBRID_META["run_start_ts"] = time.time()
+        model_obj = getattr(patcher, "model", None)
+        if model_obj is not None:
+            _HYBRID_META["model_class"] = model_obj.__class__.__name__
+            model_type = getattr(model_obj, "model_type", None)
+            if model_type is not None:
+                _HYBRID_META["model_type"] = str(model_type)
     if cfg.get("log_steps", False):
         logger.info(
             "Hybrid attention pre-run: enabled local_window=%s window_min=%s window_max=%s window_sigma=[%s,%s] prefix_tokens=%s global_dim=%s global_P=%s global_weight=%.3g",
@@ -588,6 +697,9 @@ def cleanup_callback(patcher):
     if cfg.get("log_quality_stats", False):
         summary = _format_quality_summary()
         if summary:
-            logger.info("Hybrid attention quality stats: %s %s", summary, _format_config_summary(cfg))
+            logger.info("Hybrid attention quality stats: %s %s %s", summary, _format_config_summary(cfg), _format_meta_summary(_HYBRID_META))
+            summary_dict = _quality_summary_dict()
+            if summary_dict:
+                _append_quality_jsonl(cfg, summary_dict, _HYBRID_META.copy())
     if cfg.get("log_steps", False):
         logger.info("Hybrid attention cleanup: restored Flux attention")
