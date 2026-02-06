@@ -23,3 +23,57 @@ def test_taylor_feature_map_shape():
     phi = hybrid_attention._taylor_feature_map(x, P=2, scale=1.0)
     assert phi.shape[:3] == x.shape[:3]
     assert phi.shape[-1] > 0
+
+
+def test_pre_run_callback_reads_model_options(monkeypatch):
+    called = {"patch": 0}
+
+    def fake_patch():
+        called["patch"] += 1
+
+    monkeypatch.setattr(hybrid_attention, "patch_flux_attention", fake_patch)
+
+    class DummyPatcher:
+        def __init__(self):
+            self.model_options = {
+                "transformer_options": {"hybrid_taylor_attention": {"enabled": True, "log_steps": False}}
+            }
+
+    hybrid_attention.pre_run_callback(DummyPatcher())
+    assert called["patch"] == 1
+
+
+def test_pre_run_callback_ignores_disabled(monkeypatch):
+    called = {"patch": 0}
+
+    def fake_patch():
+        called["patch"] += 1
+
+    monkeypatch.setattr(hybrid_attention, "patch_flux_attention", fake_patch)
+
+    class DummyPatcher:
+        def __init__(self):
+            self.model_options = {
+                "transformer_options": {"hybrid_taylor_attention": {"enabled": False, "log_steps": False}}
+            }
+
+    hybrid_attention.pre_run_callback(DummyPatcher())
+    assert called["patch"] == 0
+
+
+def test_cleanup_callback_reads_model_options(monkeypatch):
+    called = {"restore": 0}
+
+    def fake_restore():
+        called["restore"] += 1
+
+    monkeypatch.setattr(hybrid_attention, "restore_flux_attention", fake_restore)
+
+    class DummyPatcher:
+        def __init__(self):
+            self.model_options = {
+                "transformer_options": {"hybrid_taylor_attention": {"enabled": True, "log_steps": False}}
+            }
+
+    hybrid_attention.cleanup_callback(DummyPatcher())
+    assert called["restore"] == 1

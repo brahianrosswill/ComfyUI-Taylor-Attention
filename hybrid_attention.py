@@ -379,7 +379,9 @@ def hybrid_wrapper(executor, *args, **kwargs):
 
 
 def pre_run_callback(patcher):
-    transformer_options = getattr(patcher.model, "model_options", {}).get("transformer_options", {})
+    transformer_options = getattr(patcher, "model_options", {}).get("transformer_options", {})
+    if not transformer_options:
+        transformer_options = getattr(getattr(patcher, "model", None), "model_options", {}).get("transformer_options", {})
     cfg = transformer_options.get("hybrid_taylor_attention")
     if not cfg or not cfg.get("enabled", False):
         return
@@ -396,7 +398,9 @@ def pre_run_callback(patcher):
 
 
 def cleanup_callback(patcher):
-    transformer_options = getattr(patcher.model, "model_options", {}).get("transformer_options", {})
+    transformer_options = getattr(patcher, "model_options", {}).get("transformer_options", {})
+    if not transformer_options:
+        transformer_options = getattr(getattr(patcher, "model", None), "model_options", {}).get("transformer_options", {})
     cfg = transformer_options.get("hybrid_taylor_attention")
     if not cfg or not cfg.get("enabled", False):
         return

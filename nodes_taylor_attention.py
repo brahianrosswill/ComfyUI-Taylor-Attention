@@ -439,22 +439,24 @@ class HybridTaylorAttentionBackend(io.ComfyNode):
                 force_fp32,
                 log_steps,
             )
-            if not transformer_options.get("_hybrid_callbacks_added"):
-                patcher_extension.add_callback(
-                    patcher_extension.CallbacksMP.ON_PRE_RUN,
-                    hybrid_attention.pre_run_callback,
-                    transformer_options,
-                )
-                patcher_extension.add_callback(
-                    patcher_extension.CallbacksMP.ON_CLEANUP,
-                    hybrid_attention.cleanup_callback,
-                    transformer_options,
-                )
-                transformer_options["_hybrid_callbacks_added"] = True
+            callback_key = "hybrid_taylor_attention"
+            m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_PRE_RUN, callback_key)
+            m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_CLEANUP, callback_key)
+            m.add_callback_with_key(
+                patcher_extension.CallbacksMP.ON_PRE_RUN,
+                callback_key,
+                hybrid_attention.pre_run_callback,
+            )
+            m.add_callback_with_key(
+                patcher_extension.CallbacksMP.ON_CLEANUP,
+                callback_key,
+                hybrid_attention.cleanup_callback,
+            )
         else:
             transformer_options.pop("hybrid_taylor_attention", None)
-            if transformer_options.get("_hybrid_callbacks_added"):
-                transformer_options["_hybrid_callbacks_added"] = False
+            callback_key = "hybrid_taylor_attention"
+            m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_PRE_RUN, callback_key)
+            m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_CLEANUP, callback_key)
 
         return io.NodeOutput(m)
 

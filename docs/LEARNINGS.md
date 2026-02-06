@@ -28,3 +28,4 @@
 - Added a fully fused Triton path (fused_full_kernel) that uses precomputed feature tables to avoid Python feature loops.
 - Added a hybrid local/global attention node that patches Flux attention to combine local RoPE attention with a global low-dim Taylor approximation.
 - Hybrid attention now patches both `flux.math` and `flux.layers` attention bindings via model pre-run/cleanup callbacks.
+- Model-level callbacks must be registered on `ModelPatcher` (transformer_options callbacks are not invoked by pre-run/cleanup).
