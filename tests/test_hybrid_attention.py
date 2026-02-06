@@ -65,6 +65,15 @@ def test_project_pca_respects_dtype_in_cache():
     assert proj.dtype == torch.bfloat16
 
 
+def test_global_taylor_attention_dtype_matches_input():
+    cfg = hybrid_attention._resolve_config({"enabled": True, "global_dim": 2, "global_P": 2, "force_fp32": False})
+    q = torch.randn(1, 1, 3, 4, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 3, 4, dtype=torch.bfloat16)
+    v = torch.randn(1, 1, 3, 4, dtype=torch.bfloat16)
+    out = hybrid_attention._global_taylor_attention(cfg, q, k, v, None, scale=1.0)
+    assert out.dtype == v.dtype
+
+
 def test_pre_run_callback_reads_model_options(monkeypatch):
     called = {"patch": 0}
 

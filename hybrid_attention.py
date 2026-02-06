@@ -290,10 +290,16 @@ def _global_taylor_attention(
     phi_q = _taylor_feature_map(q_low, cfg.global_P, 1.0)
     phi_k = _taylor_feature_map(k_low, cfg.global_P, 1.0)
 
+    dtype_accum = torch.float32 if cfg.force_fp32 else v.dtype
+    if phi_q.dtype != dtype_accum:
+        phi_q = phi_q.to(dtype=dtype_accum)
+    if phi_k.dtype != dtype_accum:
+        phi_k = phi_k.to(dtype=dtype_accum)
     if key_mask is not None:
-        phi_k = phi_k * key_mask[..., None]
+        phi_k = phi_k * key_mask.to(dtype=dtype_accum)[..., None]
 
-    kv_summary = torch.einsum("b h n r, b h n d -> b h r d", phi_k, v.float())
+    v_accum = v.to(dtype=dtype_accum)
+    kv_summary = torch.einsum("b h n r, b h n d -> b h r d", phi_k, v_accum)
     global_out = torch.einsum("b h n r, b h r d -> b h n d", phi_q, kv_summary)
     k_sum = phi_k.sum(dim=2)
     denom = torch.einsum("b h n r, b h r -> b h n", phi_q, k_sum)
