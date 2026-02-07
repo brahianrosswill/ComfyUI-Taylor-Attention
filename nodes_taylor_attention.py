@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
+import torch
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 import comfy.patcher_extension as patcher_extension
@@ -15,7 +16,211 @@ import flux2_ttr
 import flux2_ttr_controller
 import sweep_utils
 
+try:
+    import comfy.sample as comfy_sample
+    import comfy.samplers as comfy_samplers
+    import comfy.model_management as comfy_model_management
+except Exception:
+    comfy_sample = None
+    comfy_samplers = None
+    comfy_model_management = None
+
 logger = logging.getLogger(__name__)
+
+_TRAINING_CONFIG_KEYS = (
+    "loss_config",
+    "optimizer_config",
+    "schedule_config",
+    "logging_config",
+)
+
+_TRAINING_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
+    "loss_config": {
+        "rmse_weight": 1.0,
+        "cosine_weight": 1.0,
+        "lpips_weight": 0.0,
+        "huber_beta": 0.05,
+    },
+    "optimizer_config": {
+        "learning_rate": 1e-4,
+        "grad_clip_norm": 1.0,
+        "alpha_lr_multiplier": 5.0,
+        "phi_lr_multiplier": 1.0,
+    },
+    "schedule_config": {
+        "target_ttr_ratio": 0.7,
+        "gumbel_temperature_start": 1.0,
+        "gumbel_temperature_end": 0.5,
+        "warmup_steps": 0,
+    },
+    "logging_config": {
+        "comet_enabled": False,
+        "comet_api_key": "",
+        "comet_project_name": "ttr-distillation",
+        "comet_workspace": "",
+        "log_every": 10,
+    },
+}
+
+_LEGACY_TRAINER_DEFAULTS = {
+    "learning_rate": 1e-4,
+    "grad_clip_norm": 1.0,
+    "alpha_lr_multiplier": 5.0,
+    "phi_lr_multiplier": 1.0,
+    "huber_beta": 0.05,
+    "comet_enabled": True,
+    "comet_api_key": "",
+    "comet_project_name": "ttr-distillation",
+    "comet_workspace": "comet-workspace",
+    "log_every": 50,
+}
+
+
+@io.comfytype(io_type="TTR_TRAINING_CONFIG")
+class TTRTrainingConfig(io.ComfyTypeIO):
+    Type = dict
+
+
+@io.comfytype(io_type="TTR_CONTROLLER")
+class TTRControllerType(io.ComfyTypeIO):
+    Type = flux2_ttr_controller.TTRController
+
+
+def _normalize_training_config(training_config: Optional[dict]) -> dict[str, dict[str, Any]]:
+    normalized: dict[str, dict[str, Any]] = {key: {} for key in _TRAINING_CONFIG_KEYS}
+    if not isinstance(training_config, dict):
+        return normalized
+    for key in _TRAINING_CONFIG_KEYS:
+        section = training_config.get(key)
+        if isinstance(section, dict):
+            normalized[key] = dict(section)
+    return normalized
+
+
+def _float_or(value: Any, default: float) -> float:
+    try:
+        v = float(value)
+        if math.isfinite(v):
+            return v
+    except Exception:
+        pass
+    return float(default)
+
+
+def _int_or(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _bool_or(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return bool(default)
+
+
+def _string_or(value: Any, default: str) -> str:
+    if value is None:
+        return str(default)
+    return str(value)
+
+
+def _extract_layer_idx(layer_key: str) -> Optional[int]:
+    if ":" not in layer_key:
+        return None
+    _, idx_text = layer_key.split(":", 1)
+    try:
+        return int(idx_text)
+    except Exception:
+        return None
+
+
+def _resolve_ttr_runtime_from_model(model_ttr) -> tuple[flux2_ttr.Flux2TTRRuntime, dict]:
+    transformer_options = model_ttr.model_options.setdefault("transformer_options", {})
+    cfg = transformer_options.get("flux2_ttr")
+    if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+        raise ValueError(
+            "Flux2TTRControllerTrainer requires a model with trained TTR modules. Run Flux2TTRTrainer first."
+        )
+
+    runtime_id = cfg.get("runtime_id")
+    runtime = flux2_ttr.get_runtime(runtime_id) if isinstance(runtime_id, str) else None
+    if runtime is None:
+        runtime = flux2_ttr._recover_runtime_from_config(cfg)
+        if runtime is not None:
+            new_runtime_id = flux2_ttr.register_runtime(runtime)
+            cfg["runtime_id"] = new_runtime_id
+    if runtime is None:
+        raise ValueError(
+            "Flux2TTRControllerTrainer requires a model with trained TTR modules. Run Flux2TTRTrainer first."
+        )
+
+    ready_layers = [layer_key for layer_key, ready in runtime.layer_ready.items() if ready and layer_key.startswith("single:")]
+    if not ready_layers:
+        raise ValueError(
+            "Flux2TTRControllerTrainer requires a model with trained TTR modules. Run Flux2TTRTrainer first."
+        )
+    return runtime, cfg
+
+
+def _build_training_config_payload(
+    *,
+    rmse_weight: float,
+    cosine_weight: float,
+    lpips_weight: float,
+    huber_beta: float,
+    learning_rate: float,
+    grad_clip_norm: float,
+    alpha_lr_multiplier: float,
+    phi_lr_multiplier: float,
+    target_ttr_ratio: float,
+    gumbel_temperature_start: float,
+    gumbel_temperature_end: float,
+    warmup_steps: int,
+    comet_enabled: bool,
+    comet_api_key: str,
+    comet_project_name: str,
+    comet_workspace: str,
+    log_every: int,
+) -> dict[str, dict[str, Any]]:
+    return {
+        "loss_config": {
+            "rmse_weight": float(rmse_weight),
+            "cosine_weight": float(cosine_weight),
+            "lpips_weight": float(lpips_weight),
+            "huber_beta": float(huber_beta),
+        },
+        "optimizer_config": {
+            "learning_rate": float(learning_rate),
+            "grad_clip_norm": float(grad_clip_norm),
+            "alpha_lr_multiplier": float(alpha_lr_multiplier),
+            "phi_lr_multiplier": float(phi_lr_multiplier),
+        },
+        "schedule_config": {
+            "target_ttr_ratio": float(target_ttr_ratio),
+            "gumbel_temperature_start": float(gumbel_temperature_start),
+            "gumbel_temperature_end": float(gumbel_temperature_end),
+            "warmup_steps": int(warmup_steps),
+        },
+        "logging_config": {
+            "comet_enabled": bool(comet_enabled),
+            "comet_api_key": str(comet_api_key or ""),
+            "comet_project_name": str(comet_project_name or "ttr-distillation"),
+            "comet_workspace": str(comet_workspace or ""),
+            "log_every": max(1, int(log_every)),
+        },
+    }
 
 
 def _build_config(
@@ -491,48 +696,99 @@ class HybridTaylorAttentionBackend(io.ComfyNode):
         return io.NodeOutput(m)
 
 
-class Flux2TTR(io.ComfyNode):
+class Flux2TTRTrainingParameters(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="Flux2TTR",
-            display_name="Flux2TTR",
+            node_id="Flux2TTRTrainingParameters",
+            display_name="Flux2TTRTrainingParameters",
             category="advanced/attention",
-            description="Replace Flux single-block attention with hybrid kernel-regression + landmark residual attention.",
+            description="Shared Flux2TTR training hyperparameters for Phase-1 and Phase-2 nodes.",
+            inputs=[
+                io.Float.Input("rmse_weight", default=1.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input("cosine_weight", default=1.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input("lpips_weight", default=0.0, min=0.0, max=1000.0, step=1e-3),
+                io.Float.Input("huber_beta", default=0.05, min=1e-6, max=10.0, step=1e-4),
+                io.Float.Input("learning_rate", default=1e-4, min=1e-7, max=1.0, step=1e-7),
+                io.Float.Input("grad_clip_norm", default=1.0, min=0.0, max=100.0, step=1e-3),
+                io.Float.Input("alpha_lr_multiplier", default=5.0, min=0.0, max=100.0, step=1e-3),
+                io.Float.Input("phi_lr_multiplier", default=1.0, min=0.0, max=100.0, step=1e-3),
+                io.Float.Input("target_ttr_ratio", default=0.7, min=0.0, max=1.0, step=1e-3),
+                io.Float.Input("gumbel_temperature_start", default=1.0, min=1e-4, max=10.0, step=1e-3),
+                io.Float.Input("gumbel_temperature_end", default=0.5, min=1e-4, max=10.0, step=1e-3),
+                io.Int.Input("warmup_steps", default=0, min=0, max=1000000, step=1),
+                io.Boolean.Input("comet_enabled", default=False),
+                io.String.Input("comet_api_key", default="", multiline=False),
+                io.String.Input("comet_project_name", default="ttr-distillation", multiline=False),
+                io.String.Input("comet_workspace", default="", multiline=False),
+                io.Int.Input("log_every", default=10, min=1, max=1000000, step=1),
+            ],
+            outputs=[TTRTrainingConfig.Output("training_config")],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        rmse_weight: float,
+        cosine_weight: float,
+        lpips_weight: float,
+        huber_beta: float,
+        learning_rate: float,
+        grad_clip_norm: float,
+        alpha_lr_multiplier: float,
+        phi_lr_multiplier: float,
+        target_ttr_ratio: float,
+        gumbel_temperature_start: float,
+        gumbel_temperature_end: float,
+        warmup_steps: int,
+        comet_enabled: bool,
+        comet_api_key: str,
+        comet_project_name: str,
+        comet_workspace: str,
+        log_every: int,
+    ) -> io.NodeOutput:
+        training_config = _build_training_config_payload(
+            rmse_weight=rmse_weight,
+            cosine_weight=cosine_weight,
+            lpips_weight=lpips_weight,
+            huber_beta=huber_beta,
+            learning_rate=learning_rate,
+            grad_clip_norm=grad_clip_norm,
+            alpha_lr_multiplier=alpha_lr_multiplier,
+            phi_lr_multiplier=phi_lr_multiplier,
+            target_ttr_ratio=target_ttr_ratio,
+            gumbel_temperature_start=gumbel_temperature_start,
+            gumbel_temperature_end=gumbel_temperature_end,
+            warmup_steps=warmup_steps,
+            comet_enabled=comet_enabled,
+            comet_api_key=comet_api_key,
+            comet_project_name=comet_project_name,
+            comet_workspace=comet_workspace,
+            log_every=log_every,
+        )
+        return io.NodeOutput(training_config)
+
+
+class Flux2TTRTrainer(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Flux2TTRTrainer",
+            display_name="Flux2TTRTrainer",
+            category="advanced/attention",
+            description="Phase-1: distill Flux TTR linear attention modules from native attention.",
             inputs=[
                 io.Model.Input("model"),
                 io.Latent.Input("latents"),
                 io.Conditioning.Input("conditioning"),
-                io.Float.Input("learning_rate", default=1e-4, min=1e-7, max=1.0, step=1e-7),
+                TTRTrainingConfig.Input("training_config", optional=True),
                 io.Int.Input("steps", default=512, min=0, max=200000, step=1),
                 io.Boolean.Input("training", default=True, tooltip="Train TTR layers by distillation when enabled."),
                 io.Boolean.Input(
                     "training_preview_ttr",
                     default=True,
                     tooltip="When training, output TTR student attention for visual preview instead of teacher passthrough.",
-                ),
-                io.Boolean.Input(
-                    "comet_enabled",
-                    default=True,
-                    tooltip="Log per-layer distillation metrics to Comet during training.",
-                ),
-                io.String.Input(
-                    "comet_project_name",
-                    default="ttr-distillation",
-                    multiline=False,
-                    tooltip="Comet project name used when metric logging is enabled.",
-                ),
-                io.String.Input(
-                    "comet_workspace",
-                    default="comet-workspace",
-                    multiline=False,
-                    tooltip="Comet workspace used when metric logging is enabled.",
-                ),
-                io.String.Input(
-                    "comet_api_key",
-                    default="",
-                    multiline=False,
-                    tooltip="Optional Comet API key override. Leave blank to use COMET_API_KEY env var.",
                 ),
                 io.String.Input(
                     "checkpoint_path",
@@ -588,22 +844,6 @@ class Flux2TTR(io.ComfyNode):
                     step=1e-3,
                     tooltip="Initial residual gate for landmark softmax branch.",
                 ),
-                io.Float.Input(
-                    "alpha_lr_multiplier",
-                    default=5.0,
-                    min=0.0,
-                    max=100.0,
-                    step=1e-3,
-                    tooltip="Learning-rate multiplier for landmark gate alpha.",
-                ),
-                io.Float.Input(
-                    "phi_lr_multiplier",
-                    default=1.0,
-                    min=0.0,
-                    max=100.0,
-                    step=1e-3,
-                    tooltip="Learning-rate multiplier for kernel feature networks.",
-                ),
                 io.Int.Input(
                     "training_query_token_cap",
                     default=128,
@@ -640,22 +880,6 @@ class Flux2TTR(io.ComfyNode):
                     max=32,
                     step=1,
                     tooltip="Number of replay optimization steps run per attention call.",
-                ),
-                io.Float.Input(
-                    "huber_beta",
-                    default=0.05,
-                    min=1e-6,
-                    max=10.0,
-                    step=1e-4,
-                    tooltip="Smooth-L1 beta for distillation loss.",
-                ),
-                io.Float.Input(
-                    "grad_clip_norm",
-                    default=1.0,
-                    min=0.0,
-                    max=100.0,
-                    step=1e-3,
-                    tooltip="Global gradient clipping norm (0 disables clipping).",
                 ),
                 io.Float.Input(
                     "readiness_threshold",
@@ -727,7 +951,7 @@ class Flux2TTR(io.ComfyNode):
                     "controller_checkpoint_path",
                     default="",
                     multiline=False,
-                    tooltip="Optional Phase-2 controller checkpoint. When provided in inference mode, per-step controller masks select teacher vs TTR per layer.",
+                    tooltip="Optional Phase-2 controller checkpoint used for inference-time layer routing.",
                 ),
             ],
             outputs=[io.Model.Output(), io.Float.Output("loss_value")],
@@ -740,14 +964,10 @@ class Flux2TTR(io.ComfyNode):
         model,
         latents,
         conditioning,
-        learning_rate: float,
+        training_config: Optional[dict],
         steps: int,
         training: bool,
         training_preview_ttr: bool,
-        comet_enabled: bool,
-        comet_project_name: str,
-        comet_workspace: str,
-        comet_api_key: str,
         checkpoint_path: str,
         feature_dim: int,
         query_chunk_size: int,
@@ -755,15 +975,11 @@ class Flux2TTR(io.ComfyNode):
         landmark_count: int,
         text_tokens_guess: int,
         alpha_init: float,
-        alpha_lr_multiplier: float,
-        phi_lr_multiplier: float,
         training_query_token_cap: int,
         replay_buffer_size: int,
         replay_offload_cpu: bool,
         replay_max_mb: int,
         train_steps_per_call: int,
-        huber_beta: float,
-        grad_clip_norm: float,
         readiness_threshold: float,
         readiness_min_updates: int,
         enable_memory_reserve: bool,
@@ -775,10 +991,78 @@ class Flux2TTR(io.ComfyNode):
         inference_mixed_precision: bool,
         controller_checkpoint_path: str,
     ) -> io.NodeOutput:
+        del latents, conditioning
         feature_dim = flux2_ttr.validate_feature_dim(feature_dim)
         checkpoint_path = (checkpoint_path or "").strip()
         controller_checkpoint_path = (controller_checkpoint_path or "").strip()
         train_steps = int(steps)
+
+        normalized_cfg = _normalize_training_config(training_config)
+        loss_cfg = normalized_cfg["loss_config"]
+        opt_cfg = normalized_cfg["optimizer_config"]
+        schedule_cfg = normalized_cfg["schedule_config"]
+        logging_cfg = normalized_cfg["logging_config"]
+        has_training_config = isinstance(training_config, dict)
+
+        if has_training_config:
+            learning_rate = _float_or(opt_cfg.get("learning_rate"), _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["learning_rate"])
+            grad_clip_norm = _float_or(opt_cfg.get("grad_clip_norm"), _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["grad_clip_norm"])
+            alpha_lr_multiplier = _float_or(opt_cfg.get("alpha_lr_multiplier"), _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["alpha_lr_multiplier"])
+            phi_lr_multiplier = _float_or(opt_cfg.get("phi_lr_multiplier"), _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["phi_lr_multiplier"])
+            huber_beta = _float_or(loss_cfg.get("huber_beta"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["huber_beta"])
+            comet_enabled = _bool_or(logging_cfg.get("comet_enabled"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_enabled"])
+            comet_api_key = _string_or(logging_cfg.get("comet_api_key"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_api_key"])
+            comet_project_name = _string_or(logging_cfg.get("comet_project_name"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_project_name"])
+            comet_workspace = _string_or(logging_cfg.get("comet_workspace"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["comet_workspace"])
+            comet_log_every = max(1, _int_or(logging_cfg.get("log_every"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["log_every"]))
+        else:
+            learning_rate = float(_LEGACY_TRAINER_DEFAULTS["learning_rate"])
+            grad_clip_norm = float(_LEGACY_TRAINER_DEFAULTS["grad_clip_norm"])
+            alpha_lr_multiplier = float(_LEGACY_TRAINER_DEFAULTS["alpha_lr_multiplier"])
+            phi_lr_multiplier = float(_LEGACY_TRAINER_DEFAULTS["phi_lr_multiplier"])
+            huber_beta = float(_LEGACY_TRAINER_DEFAULTS["huber_beta"])
+            comet_enabled = bool(_LEGACY_TRAINER_DEFAULTS["comet_enabled"])
+            comet_api_key = str(_LEGACY_TRAINER_DEFAULTS["comet_api_key"])
+            comet_project_name = str(_LEGACY_TRAINER_DEFAULTS["comet_project_name"])
+            comet_workspace = str(_LEGACY_TRAINER_DEFAULTS["comet_workspace"])
+            comet_log_every = int(_LEGACY_TRAINER_DEFAULTS["log_every"])
+
+        target_ttr_ratio = _float_or(
+            schedule_cfg.get("target_ttr_ratio"),
+            _TRAINING_CONFIG_DEFAULTS["schedule_config"]["target_ttr_ratio"],
+        )
+        gumbel_temperature_start = _float_or(
+            schedule_cfg.get("gumbel_temperature_start"),
+            _TRAINING_CONFIG_DEFAULTS["schedule_config"]["gumbel_temperature_start"],
+        )
+        gumbel_temperature_end = _float_or(
+            schedule_cfg.get("gumbel_temperature_end"),
+            _TRAINING_CONFIG_DEFAULTS["schedule_config"]["gumbel_temperature_end"],
+        )
+        warmup_steps = max(0, _int_or(schedule_cfg.get("warmup_steps"), _TRAINING_CONFIG_DEFAULTS["schedule_config"]["warmup_steps"]))
+        rmse_weight = _float_or(loss_cfg.get("rmse_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["rmse_weight"])
+        cosine_weight = _float_or(loss_cfg.get("cosine_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["cosine_weight"])
+        lpips_weight = _float_or(loss_cfg.get("lpips_weight"), _TRAINING_CONFIG_DEFAULTS["loss_config"]["lpips_weight"])
+
+        resolved_training_config = _build_training_config_payload(
+            rmse_weight=rmse_weight,
+            cosine_weight=cosine_weight,
+            lpips_weight=lpips_weight,
+            huber_beta=huber_beta,
+            learning_rate=learning_rate,
+            grad_clip_norm=grad_clip_norm,
+            alpha_lr_multiplier=alpha_lr_multiplier,
+            phi_lr_multiplier=phi_lr_multiplier,
+            target_ttr_ratio=target_ttr_ratio,
+            gumbel_temperature_start=gumbel_temperature_start,
+            gumbel_temperature_end=gumbel_temperature_end,
+            warmup_steps=warmup_steps,
+            comet_enabled=comet_enabled,
+            comet_api_key=comet_api_key,
+            comet_project_name=comet_project_name,
+            comet_workspace=comet_workspace,
+            log_every=comet_log_every,
+        )
 
         m = model.clone()
         transformer_options = m.model_options.setdefault("transformer_options", {})
@@ -822,12 +1106,13 @@ class Flux2TTR(io.ComfyNode):
             comet_project_name=str(comet_project_name or "ttr-distillation"),
             comet_workspace=str(comet_workspace or "comet-workspace"),
             comet_api_key=str(comet_api_key or ""),
+            comet_log_every=int(comet_log_every),
         )
         runtime.register_layer_specs(flux2_ttr.infer_flux_single_layer_specs(m))
 
         if training:
             if checkpoint_path and os.path.isfile(checkpoint_path):
-                logger.info("Flux2TTR: loading existing checkpoint before online distillation: %s", checkpoint_path)
+                logger.info("Flux2TTRTrainer: loading existing checkpoint before online distillation: %s", checkpoint_path)
                 runtime.load_checkpoint(checkpoint_path)
             runtime.training_mode = True
             runtime.training_enabled = train_steps > 0
@@ -837,9 +1122,9 @@ class Flux2TTR(io.ComfyNode):
             loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
         else:
             if not checkpoint_path:
-                raise ValueError("Flux2TTR: checkpoint_path is required when training is disabled.")
+                raise ValueError("Flux2TTRTrainer: checkpoint_path is required when training is disabled.")
             if not os.path.isfile(checkpoint_path):
-                raise FileNotFoundError(f"Flux2TTR: checkpoint not found: {checkpoint_path}")
+                raise FileNotFoundError(f"Flux2TTRTrainer: checkpoint not found: {checkpoint_path}")
             runtime.load_checkpoint(checkpoint_path)
             runtime.training_mode = False
             runtime.training_enabled = False
@@ -855,7 +1140,7 @@ class Flux2TTR(io.ComfyNode):
         controller = None
         if controller_checkpoint_path:
             if not os.path.isfile(controller_checkpoint_path):
-                raise FileNotFoundError(f"Flux2TTR: controller checkpoint not found: {controller_checkpoint_path}")
+                raise FileNotFoundError(f"Flux2TTRTrainer: controller checkpoint not found: {controller_checkpoint_path}")
             controller = flux2_ttr_controller.load_controller_checkpoint(controller_checkpoint_path, map_location="cpu")
 
         runtime_id = flux2_ttr.register_runtime(runtime)
@@ -900,6 +1185,7 @@ class Flux2TTR(io.ComfyNode):
             "max_safe_inference_loss": float(runtime.max_safe_inference_loss),
             "checkpoint_path": checkpoint_path,
             "controller_checkpoint_path": controller_checkpoint_path,
+            "training_config": resolved_training_config,
         }
         if controller is not None:
             transformer_options["flux2_ttr"]["controller"] = controller
@@ -920,8 +1206,9 @@ class Flux2TTR(io.ComfyNode):
 
         logger.info(
             (
-                "Flux2TTR configured: training_mode=%s training_preview_ttr=%s comet_enabled=%s "
+                "Flux2TTRTrainer configured: training_mode=%s training_preview_ttr=%s comet_enabled=%s "
                 "training_steps=%d feature_dim=%d q_chunk=%d k_chunk=%d landmarks=%d "
+                "lr=%.6g alpha_lr_mul=%.4g phi_lr_mul=%.4g huber_beta=%.6g grad_clip=%.4g "
                 "replay=%d replay_offload_cpu=%s replay_max_mb=%d train_steps_per_call=%d readiness=(%.6g,%d) reserve=%s layer_range=[%d,%d] "
                 "cfg_scale=%.4g swap_layers=[%d,%d] mixed_precision=%s checkpoint=%s controller=%s loss=%.6g"
             ),
@@ -933,6 +1220,11 @@ class Flux2TTR(io.ComfyNode):
             int(query_chunk_size),
             int(key_chunk_size),
             int(landmark_count),
+            float(learning_rate),
+            float(alpha_lr_multiplier),
+            float(phi_lr_multiplier),
+            float(huber_beta),
+            float(grad_clip_norm),
             int(replay_buffer_size),
             bool(replay_offload_cpu),
             int(replay_max_mb),
@@ -951,6 +1243,617 @@ class Flux2TTR(io.ComfyNode):
             float(loss_value),
         )
         return io.NodeOutput(m, float(loss_value))
+
+
+class Flux2TTRControllerTrainer(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        sampler_options = list(comfy_samplers.KSampler.SAMPLERS) if comfy_samplers is not None else ["euler"]
+        scheduler_options = list(comfy_samplers.KSampler.SCHEDULERS) if comfy_samplers is not None else ["normal"]
+        return io.Schema(
+            node_id="Flux2TTRControllerTrainer",
+            display_name="Flux2TTRControllerTrainer",
+            category="advanced/attention",
+            description="Phase-2: train a TTR controller using dual-path sampling and REINFORCE updates.",
+            inputs=[
+                io.Model.Input("model_original"),
+                io.Model.Input("model_ttr"),
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Latent.Input("latent"),
+                io.VAE.Input("vae"),
+                TTRTrainingConfig.Input("training_config"),
+                io.Int.Input("steps", default=20, min=1, max=10000, step=1),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, step=1),
+                io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=1e-3),
+                io.Combo.Input("sampler_name", options=sampler_options, default="euler"),
+                io.Combo.Input("scheduler", options=scheduler_options, default="normal"),
+                io.String.Input("checkpoint_path", default="", multiline=False),
+                io.Int.Input("training_iterations", default=100, min=1, max=100000, step=1),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=1e-3),
+            ],
+            outputs=[
+                io.Image.Output("IMAGE_ORIGINAL"),
+                io.Image.Output("IMAGE_PATCHED"),
+                TTRControllerType.Output("CONTROLLER"),
+            ],
+            is_experimental=True,
+        )
+
+    @staticmethod
+    def _require_sampling_stack() -> None:
+        if comfy_sample is None or comfy_samplers is None:
+            raise RuntimeError("Flux2TTRControllerTrainer requires ComfyUI sampling modules (comfy.sample/comfy.samplers).")
+
+    @staticmethod
+    def _split_latent_batch(latent: dict) -> list[dict]:
+        samples = latent.get("samples")
+        if not torch.is_tensor(samples) or samples.ndim < 4:
+            raise ValueError("Flux2TTRControllerTrainer: latent must contain tensor key 'samples' with batch dimension.")
+        batch_size = int(samples.shape[0])
+        items: list[dict] = []
+        for idx in range(batch_size):
+            item = dict(latent)
+            item["samples"] = samples[idx : idx + 1]
+            noise_mask = latent.get("noise_mask")
+            if torch.is_tensor(noise_mask) and noise_mask.shape[0] == batch_size:
+                item["noise_mask"] = noise_mask[idx : idx + 1]
+            batch_index = latent.get("batch_index")
+            if isinstance(batch_index, (list, tuple)) and len(batch_index) == batch_size:
+                item["batch_index"] = [batch_index[idx]]
+            items.append(item)
+        return items
+
+    @staticmethod
+    def _sample_model(
+        *,
+        model,
+        latent: dict,
+        positive,
+        negative,
+        seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
+    ) -> dict:
+        latent_image = latent["samples"]
+        latent_image = comfy_sample.fix_empty_latent_channels(model, latent_image, latent.get("downscale_ratio_spacial", None))
+        batch_inds = latent.get("batch_index", None)
+        noise = comfy_sample.prepare_noise(latent_image, int(seed), batch_inds)
+        samples = comfy_sample.sample(
+            model,
+            noise,
+            int(steps),
+            float(cfg),
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent_image,
+            denoise=float(denoise),
+            noise_mask=latent.get("noise_mask", None),
+            disable_pbar=True,
+            seed=int(seed),
+        )
+        out = dict(latent)
+        out.pop("downscale_ratio_spacial", None)
+        out["samples"] = samples
+        return out
+
+    @staticmethod
+    def _decode_vae(vae, latent_dict: dict) -> torch.Tensor:
+        latent_t = latent_dict["samples"]
+        if getattr(latent_t, "is_nested", False):
+            latent_t = latent_t.unbind()[0]
+        images = vae.decode(latent_t)
+        if images.ndim == 5:
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        return images
+
+    @staticmethod
+    def _to_lpips_bchw(images: torch.Tensor) -> torch.Tensor:
+        if images.ndim != 4:
+            raise ValueError("Flux2TTRControllerTrainer: expected decoded images with shape [B,H,W,C] or [B,C,H,W].")
+        if images.shape[-1] == 3:
+            x = images.permute(0, 3, 1, 2).contiguous()
+        elif images.shape[1] == 3:
+            x = images
+        else:
+            raise ValueError("Flux2TTRControllerTrainer: decoded images must have 3 channels.")
+        x = x.float()
+        if float(x.min().item()) >= 0.0 and float(x.max().item()) <= 1.0:
+            x = x * 2.0 - 1.0
+        return x.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def _maybe_unload_model(model) -> None:
+        if comfy_model_management is None:
+            return
+        try:
+            unload_fn = getattr(comfy_model_management, "unload_model_clones", None)
+            if callable(unload_fn):
+                unload_fn(model)
+                return
+            free_memory = getattr(comfy_model_management, "free_memory", None)
+            if callable(free_memory):
+                device = getattr(model, "load_device", None)
+                if device is None and hasattr(comfy_model_management, "get_torch_device"):
+                    device = comfy_model_management.get_torch_device()
+                if device is not None:
+                    free_memory(1e30, device)
+        except Exception as exc:
+            logger.debug("Flux2TTRControllerTrainer: failed to unload model from VRAM (%s).", exc)
+
+    @staticmethod
+    def _empty_cuda_cache() -> None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _representative_sigma(model, scheduler: str, steps: int) -> float:
+        if comfy_samplers is None:
+            return 0.0
+        try:
+            model_sampling = model.get_model_object("model_sampling")
+            sigmas = comfy_samplers.calculate_sigmas(model_sampling, scheduler, int(steps))
+            if torch.is_tensor(sigmas) and sigmas.numel() > 0:
+                return float(sigmas[0].item())
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _maybe_start_comet(logging_cfg: dict[str, Any], training_config: dict[str, dict[str, Any]]):
+        enabled = _bool_or(logging_cfg.get("comet_enabled"), False)
+        if not enabled:
+            return None
+        try:
+            import comet_ml  # type: ignore
+
+            api_key = _string_or(logging_cfg.get("comet_api_key"), "").strip() or os.getenv("COMET_API_KEY", "")
+            project_name = _string_or(logging_cfg.get("comet_project_name"), "ttr-distillation")
+            workspace = _string_or(logging_cfg.get("comet_workspace"), "").strip() or None
+            experiment = comet_ml.start(api_key=api_key or None, project_name=project_name, workspace=workspace)
+            experiment.log_parameters(
+                {
+                    "flux2ttr_phase": "controller_train",
+                    "loss_config": dict(training_config.get("loss_config", {})),
+                    "optimizer_config": dict(training_config.get("optimizer_config", {})),
+                    "schedule_config": dict(training_config.get("schedule_config", {})),
+                }
+            )
+            return experiment
+        except Exception as exc:
+            logger.warning("Flux2TTRControllerTrainer: failed to initialize Comet logging (%s).", exc)
+            return None
+
+    @classmethod
+    def execute(
+        cls,
+        model_original,
+        model_ttr,
+        positive,
+        negative,
+        latent,
+        vae,
+        training_config: dict,
+        steps: int,
+        seed: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        checkpoint_path: str,
+        training_iterations: int,
+        denoise: float,
+    ) -> io.NodeOutput:
+        cls._require_sampling_stack()
+        runtime, flux_cfg = _resolve_ttr_runtime_from_model(model_ttr)
+        runtime.training_mode = False
+        runtime.training_enabled = False
+        runtime.steps_remaining = 0
+        flux_cfg["training_mode"] = False
+        flux_cfg["training"] = False
+
+        layer_indices: list[int] = []
+        for layer_key in runtime.layer_specs:
+            if not layer_key.startswith("single:"):
+                continue
+            idx = _extract_layer_idx(layer_key)
+            if idx is not None and idx >= 0:
+                layer_indices.append(idx)
+        if not layer_indices:
+            for layer_key in runtime.layer_ready:
+                idx = _extract_layer_idx(layer_key)
+                if idx is not None and idx >= 0:
+                    layer_indices.append(idx)
+        if not layer_indices:
+            raise ValueError("Flux2TTRControllerTrainer: unable to infer eligible TTR layer count from model_ttr.")
+        num_layers = max(layer_indices) + 1
+
+        normalized_cfg = _normalize_training_config(training_config)
+        loss_cfg = normalized_cfg["loss_config"]
+        schedule_cfg = normalized_cfg["schedule_config"]
+        logging_cfg = normalized_cfg["logging_config"]
+        gumbel_start = _float_or(
+            schedule_cfg.get("gumbel_temperature_start"),
+            _TRAINING_CONFIG_DEFAULTS["schedule_config"]["gumbel_temperature_start"],
+        )
+        gumbel_end = _float_or(
+            schedule_cfg.get("gumbel_temperature_end"),
+            _TRAINING_CONFIG_DEFAULTS["schedule_config"]["gumbel_temperature_end"],
+        )
+        log_every = max(1, _int_or(logging_cfg.get("log_every"), _TRAINING_CONFIG_DEFAULTS["logging_config"]["log_every"]))
+
+        checkpoint_path = (checkpoint_path or "").strip()
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            controller = flux2_ttr_controller.load_controller_checkpoint(checkpoint_path, map_location="cpu")
+        else:
+            controller = flux2_ttr_controller.TTRController(num_layers=num_layers)
+        if int(controller.num_layers) != int(num_layers):
+            raise ValueError(
+                f"Flux2TTRControllerTrainer: controller num_layers={controller.num_layers} does not match model layers={num_layers}."
+            )
+
+        device = getattr(model_ttr, "load_device", None)
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        controller.to(device=device)
+        flux_cfg["controller"] = controller
+        flux_cfg["controller_threshold"] = 0.5
+
+        trainer = flux2_ttr_controller.ControllerTrainer(controller=controller, training_config=normalized_cfg, device=device)
+        latent_items = cls._split_latent_batch(latent)
+        sigma_value = cls._representative_sigma(model_ttr, scheduler=scheduler, steps=int(steps))
+        comet_experiment = cls._maybe_start_comet(logging_cfg, normalized_cfg)
+
+        total_iterations = max(1, int(training_iterations))
+        total_steps = total_iterations * max(1, len(latent_items))
+        global_step = 0
+        last_original_images: Optional[torch.Tensor] = None
+        last_patched_images: Optional[torch.Tensor] = None
+
+        try:
+            for iteration in range(total_iterations):
+                progress = float(iteration) / float(max(1, total_iterations - 1))
+                gumbel_temperature = float(gumbel_start + (gumbel_end - gumbel_start) * progress)
+
+                iter_original_images: list[torch.Tensor] = []
+                iter_patched_images: list[torch.Tensor] = []
+
+                for latent_idx, latent_item in enumerate(latent_items):
+                    sample_seed = int(seed) + int(global_step)
+                    latent_sample = latent_item["samples"]
+                    width = int(latent_sample.shape[-1] * 8)
+                    height = int(latent_sample.shape[-2] * 8)
+
+                    teacher_latent = cls._sample_model(
+                        model=model_original,
+                        latent=latent_item,
+                        positive=positive,
+                        negative=negative,
+                        seed=sample_seed,
+                        steps=int(steps),
+                        cfg=float(cfg),
+                        sampler_name=sampler_name,
+                        scheduler=scheduler,
+                        denoise=float(denoise),
+                    )
+                    teacher_image = cls._decode_vae(vae, teacher_latent)
+
+                    cls._maybe_unload_model(model_original)
+                    cls._empty_cuda_cache()
+
+                    with torch.no_grad():
+                        logits = controller(
+                            sigma=sigma_value,
+                            cfg_scale=float(cfg),
+                            width=width,
+                            height=height,
+                        )
+                        sampled_mask = controller.sample_training_mask(
+                            logits,
+                            temperature=gumbel_temperature,
+                            hard=True,
+                        )
+                    sampled_mask = (sampled_mask.detach() > 0.5).to(dtype=torch.float32)
+                    actual_full_attn_ratio = float(sampled_mask.mean().item())
+                    flux_cfg["controller_mask_override"] = sampled_mask.detach().cpu()
+
+                    try:
+                        student_latent = cls._sample_model(
+                            model=model_ttr,
+                            latent=latent_item,
+                            positive=positive,
+                            negative=negative,
+                            seed=sample_seed,
+                            steps=int(steps),
+                            cfg=float(cfg),
+                            sampler_name=sampler_name,
+                            scheduler=scheduler,
+                            denoise=float(denoise),
+                        )
+                    finally:
+                        flux_cfg.pop("controller_mask_override", None)
+
+                    student_image = cls._decode_vae(vae, student_latent)
+                    teacher_rgb = cls._to_lpips_bchw(teacher_image)
+                    student_rgb = cls._to_lpips_bchw(student_image)
+                    quality_loss, quality_metrics = trainer.compute_loss(
+                        teacher_latent=teacher_latent["samples"],
+                        student_latent=student_latent["samples"],
+                        actual_full_attn_ratio=actual_full_attn_ratio,
+                        teacher_rgb=teacher_rgb if _float_or(loss_cfg.get("lpips_weight"), 0.0) > 0 else None,
+                        student_rgb=student_rgb if _float_or(loss_cfg.get("lpips_weight"), 0.0) > 0 else None,
+                        include_efficiency_penalty=False,
+                    )
+                    reward = -float(quality_loss.detach().item())
+                    reinforce_metrics = trainer.reinforce_step(
+                        sigma=sigma_value,
+                        cfg_scale=float(cfg),
+                        width=width,
+                        height=height,
+                        sampled_mask=sampled_mask,
+                        reward=reward,
+                        actual_full_attn_ratio=actual_full_attn_ratio,
+                    )
+
+                    metrics = {
+                        "loss": float(quality_loss.detach().item()),
+                        "rmse": float(quality_metrics["rmse"]),
+                        "cosine_distance": float(quality_metrics["cosine_distance"]),
+                        "lpips": float(quality_metrics["lpips"]),
+                        "efficiency_penalty": float(reinforce_metrics["efficiency_penalty"]),
+                        "mask_mean": float(actual_full_attn_ratio),
+                        "reward_baseline": float(reinforce_metrics["reward_baseline"]),
+                        "policy_loss": float(reinforce_metrics["policy_loss"]),
+                        "reinforce_total_loss": float(reinforce_metrics["total_loss"]),
+                        "gumbel_temperature": float(gumbel_temperature),
+                        "sigma": float(sigma_value),
+                        "iteration": float(iteration + 1),
+                        "latent_index": float(latent_idx),
+                    }
+
+                    global_step += 1
+                    if comet_experiment is not None and (global_step % log_every == 0 or global_step == total_steps):
+                        comet_experiment.log_metrics(metrics, step=global_step)
+
+                    if global_step % log_every == 0 or global_step == total_steps:
+                        logger.info(
+                            (
+                                "Flux2TTRControllerTrainer step=%d/%d iter=%d loss=%.6g rmse=%.6g cosine=%.6g "
+                                "lpips=%.6g mask_mean=%.4g eff_penalty=%.6g reward_baseline=%.6g"
+                            ),
+                            global_step,
+                            total_steps,
+                            iteration + 1,
+                            metrics["loss"],
+                            metrics["rmse"],
+                            metrics["cosine_distance"],
+                            metrics["lpips"],
+                            metrics["mask_mean"],
+                            metrics["efficiency_penalty"],
+                            metrics["reward_baseline"],
+                        )
+
+                    iter_original_images.append(teacher_image.detach().cpu())
+                    iter_patched_images.append(student_image.detach().cpu())
+
+                    del teacher_latent
+                    del student_latent
+                    del teacher_image
+                    del student_image
+                    del teacher_rgb
+                    del student_rgb
+                    del sampled_mask
+                    cls._empty_cuda_cache()
+
+                if iter_original_images:
+                    last_original_images = torch.cat(iter_original_images, dim=0)
+                if iter_patched_images:
+                    last_patched_images = torch.cat(iter_patched_images, dim=0)
+        finally:
+            if comet_experiment is not None:
+                try:
+                    comet_experiment.end()
+                except Exception:
+                    pass
+
+        if checkpoint_path:
+            flux2_ttr_controller.save_controller_checkpoint(controller, checkpoint_path)
+
+        if last_original_images is None or last_patched_images is None:
+            raise RuntimeError("Flux2TTRControllerTrainer: no samples were produced.")
+
+        return io.NodeOutput(last_original_images, last_patched_images, controller)
+
+
+class Flux2TTRController(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Flux2TTRController",
+            display_name="Flux2TTRController",
+            category="advanced/attention",
+            description="Inference node: load TTR + controller checkpoints and patch the model for dynamic layer routing.",
+            inputs=[
+                io.Model.Input("model"),
+                io.String.Input("ttr_checkpoint_path", default="", multiline=False),
+                io.String.Input("controller_checkpoint_path", default="", multiline=False),
+                io.Float.Input("quality_speed", default=0.5, min=0.0, max=1.0, step=1e-3),
+            ],
+            outputs=[io.Model.Output()],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        ttr_checkpoint_path: str,
+        controller_checkpoint_path: str,
+        quality_speed: float,
+    ) -> io.NodeOutput:
+        ttr_checkpoint_path = (ttr_checkpoint_path or "").strip()
+        controller_checkpoint_path = (controller_checkpoint_path or "").strip()
+        if not ttr_checkpoint_path:
+            raise ValueError("Flux2TTRController: ttr_checkpoint_path is required.")
+        if not os.path.isfile(ttr_checkpoint_path):
+            raise FileNotFoundError(f"Flux2TTRController: TTR checkpoint not found: {ttr_checkpoint_path}")
+        if not controller_checkpoint_path:
+            raise ValueError("Flux2TTRController: controller_checkpoint_path is required.")
+        if not os.path.isfile(controller_checkpoint_path):
+            raise FileNotFoundError(
+                f"Flux2TTRController: controller checkpoint not found: {controller_checkpoint_path}"
+            )
+
+        m = model.clone()
+        transformer_options = m.model_options.setdefault("transformer_options", {})
+        prev_cfg = transformer_options.get("flux2_ttr")
+        if isinstance(prev_cfg, dict):
+            prev_runtime = prev_cfg.get("runtime_id")
+            if isinstance(prev_runtime, str):
+                flux2_ttr.unregister_runtime(prev_runtime)
+
+        feature_dim = flux2_ttr.validate_feature_dim(int(prev_cfg.get("feature_dim", 256)) if isinstance(prev_cfg, dict) else 256)
+        learning_rate = _float_or(
+            prev_cfg.get("learning_rate", _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["learning_rate"]) if isinstance(prev_cfg, dict) else _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["learning_rate"],
+            _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["learning_rate"],
+        )
+        query_chunk_size = _int_or(prev_cfg.get("query_chunk_size", 256) if isinstance(prev_cfg, dict) else 256, 256)
+        key_chunk_size = _int_or(prev_cfg.get("key_chunk_size", 1024) if isinstance(prev_cfg, dict) else 1024, 1024)
+        landmark_count = _int_or(prev_cfg.get("landmark_count", 128) if isinstance(prev_cfg, dict) else 128, 128)
+        text_tokens_guess = _int_or(prev_cfg.get("text_tokens_guess", 77) if isinstance(prev_cfg, dict) else 77, 77)
+        alpha_init = _float_or(prev_cfg.get("alpha_init", 0.1) if isinstance(prev_cfg, dict) else 0.1, 0.1)
+        alpha_lr_multiplier = _float_or(
+            prev_cfg.get("alpha_lr_multiplier", _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["alpha_lr_multiplier"]) if isinstance(prev_cfg, dict) else _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["alpha_lr_multiplier"],
+            _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["alpha_lr_multiplier"],
+        )
+        phi_lr_multiplier = _float_or(
+            prev_cfg.get("phi_lr_multiplier", _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["phi_lr_multiplier"]) if isinstance(prev_cfg, dict) else _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["phi_lr_multiplier"],
+            _TRAINING_CONFIG_DEFAULTS["optimizer_config"]["phi_lr_multiplier"],
+        )
+        training_query_token_cap = _int_or(prev_cfg.get("training_query_token_cap", 128) if isinstance(prev_cfg, dict) else 128, 128)
+        replay_buffer_size = _int_or(prev_cfg.get("replay_buffer_size", 8) if isinstance(prev_cfg, dict) else 8, 8)
+        replay_offload_cpu = _bool_or(prev_cfg.get("replay_offload_cpu", True) if isinstance(prev_cfg, dict) else True, True)
+        replay_max_bytes = _int_or(prev_cfg.get("replay_max_bytes", 768 * 1024 * 1024) if isinstance(prev_cfg, dict) else 768 * 1024 * 1024, 768 * 1024 * 1024)
+        train_steps_per_call = _int_or(prev_cfg.get("train_steps_per_call", 1) if isinstance(prev_cfg, dict) else 1, 1)
+        huber_beta = _float_or(prev_cfg.get("huber_beta", 0.05) if isinstance(prev_cfg, dict) else 0.05, 0.05)
+        grad_clip_norm = _float_or(prev_cfg.get("grad_clip_norm", 1.0) if isinstance(prev_cfg, dict) else 1.0, 1.0)
+        readiness_threshold = _float_or(prev_cfg.get("readiness_threshold", 0.12) if isinstance(prev_cfg, dict) else 0.12, 0.12)
+        readiness_min_updates = _int_or(prev_cfg.get("readiness_min_updates", 24) if isinstance(prev_cfg, dict) else 24, 24)
+        enable_memory_reserve = _bool_or(prev_cfg.get("enable_memory_reserve", False) if isinstance(prev_cfg, dict) else False, False)
+        layer_start = _int_or(prev_cfg.get("layer_start", -1) if isinstance(prev_cfg, dict) else -1, -1)
+        layer_end = _int_or(prev_cfg.get("layer_end", -1) if isinstance(prev_cfg, dict) else -1, -1)
+        cfg_scale = _float_or(prev_cfg.get("cfg_scale", 1.0) if isinstance(prev_cfg, dict) else 1.0, 1.0)
+        min_swap_layers = _int_or(prev_cfg.get("min_swap_layers", 1) if isinstance(prev_cfg, dict) else 1, 1)
+        max_swap_layers = _int_or(prev_cfg.get("max_swap_layers", -1) if isinstance(prev_cfg, dict) else -1, -1)
+        inference_mixed_precision = _bool_or(
+            prev_cfg.get("inference_mixed_precision", True) if isinstance(prev_cfg, dict) else True,
+            True,
+        )
+
+        runtime = flux2_ttr.Flux2TTRRuntime(
+            feature_dim=feature_dim,
+            learning_rate=float(learning_rate),
+            training=False,
+            steps=0,
+            scan_chunk_size=int(query_chunk_size),
+            key_chunk_size=int(key_chunk_size),
+            landmark_count=int(landmark_count),
+            text_tokens_guess=int(text_tokens_guess),
+            alpha_init=float(alpha_init),
+            alpha_lr_multiplier=float(alpha_lr_multiplier),
+            phi_lr_multiplier=float(phi_lr_multiplier),
+            training_query_token_cap=int(training_query_token_cap),
+            replay_buffer_size=int(replay_buffer_size),
+            replay_offload_cpu=bool(replay_offload_cpu),
+            replay_max_bytes=int(replay_max_bytes),
+            train_steps_per_call=int(train_steps_per_call),
+            huber_beta=float(huber_beta),
+            grad_clip_norm=float(grad_clip_norm),
+            readiness_threshold=float(readiness_threshold),
+            readiness_min_updates=int(readiness_min_updates),
+            enable_memory_reserve=bool(enable_memory_reserve),
+            layer_start=int(layer_start),
+            layer_end=int(layer_end),
+            cfg_scale=float(cfg_scale),
+            min_swap_layers=int(min_swap_layers),
+            max_swap_layers=int(max_swap_layers),
+            inference_mixed_precision=bool(inference_mixed_precision),
+            training_preview_ttr=False,
+        )
+        runtime.register_layer_specs(flux2_ttr.infer_flux_single_layer_specs(m))
+        runtime.load_checkpoint(ttr_checkpoint_path)
+        runtime.training_mode = False
+        runtime.training_enabled = False
+        runtime.steps_remaining = 0
+        runtime.training_updates_done = 0
+
+        controller = flux2_ttr_controller.load_controller_checkpoint(controller_checkpoint_path, map_location="cpu")
+        quality_speed = min(1.0, max(0.0, float(quality_speed)))
+        threshold = 0.1 + 0.8 * quality_speed
+
+        runtime_id = flux2_ttr.register_runtime(runtime)
+        transformer_options["flux2_ttr"] = {
+            "enabled": True,
+            "training": False,
+            "training_mode": False,
+            "runtime_id": runtime_id,
+            "controller": controller,
+            "controller_threshold": float(threshold),
+            "checkpoint_path": ttr_checkpoint_path,
+            "controller_checkpoint_path": controller_checkpoint_path,
+            "feature_dim": int(feature_dim),
+            "query_chunk_size": int(query_chunk_size),
+            "scan_chunk_size": int(query_chunk_size),
+            "key_chunk_size": int(key_chunk_size),
+            "landmark_count": int(landmark_count),
+            "text_tokens_guess": int(text_tokens_guess),
+            "alpha_init": float(alpha_init),
+            "alpha_lr_multiplier": float(alpha_lr_multiplier),
+            "phi_lr_multiplier": float(phi_lr_multiplier),
+            "training_query_token_cap": int(training_query_token_cap),
+            "replay_buffer_size": int(replay_buffer_size),
+            "replay_offload_cpu": bool(replay_offload_cpu),
+            "replay_max_bytes": int(replay_max_bytes),
+            "train_steps_per_call": int(train_steps_per_call),
+            "huber_beta": float(huber_beta),
+            "grad_clip_norm": float(grad_clip_norm),
+            "readiness_threshold": float(readiness_threshold),
+            "readiness_min_updates": int(readiness_min_updates),
+            "enable_memory_reserve": bool(enable_memory_reserve),
+            "layer_start": int(layer_start),
+            "layer_end": int(layer_end),
+            "cfg_scale": float(cfg_scale),
+            "min_swap_layers": int(min_swap_layers),
+            "max_swap_layers": int(max_swap_layers),
+            "inference_mixed_precision": bool(inference_mixed_precision),
+        }
+
+        callback_key = "flux2_ttr"
+        m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_PRE_RUN, callback_key)
+        m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_CLEANUP, callback_key)
+        m.add_callback_with_key(
+            patcher_extension.CallbacksMP.ON_PRE_RUN,
+            callback_key,
+            flux2_ttr.pre_run_callback,
+        )
+        m.add_callback_with_key(
+            patcher_extension.CallbacksMP.ON_CLEANUP,
+            callback_key,
+            flux2_ttr.cleanup_callback,
+        )
+
+        logger.info(
+            "Flux2TTRController configured: ttr_ckpt=%s controller_ckpt=%s quality_speed=%.4g threshold=%.4g",
+            ttr_checkpoint_path,
+            controller_checkpoint_path,
+            quality_speed,
+            threshold,
+        )
+        return io.NodeOutput(m)
 
 
 class ClockedSweepValues(io.ComfyNode):
@@ -1086,7 +1989,16 @@ class Combinations(io.ComfyNode):
 class TaylorAttentionExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [TaylorAttentionBackend, HybridTaylorAttentionBackend, Flux2TTR, ClockedSweepValues, Combinations]
+        return [
+            TaylorAttentionBackend,
+            HybridTaylorAttentionBackend,
+            Flux2TTRTrainingParameters,
+            Flux2TTRTrainer,
+            Flux2TTRControllerTrainer,
+            Flux2TTRController,
+            ClockedSweepValues,
+            Combinations,
+        ]
 
 
 async def comfy_entrypoint() -> TaylorAttentionExtension:

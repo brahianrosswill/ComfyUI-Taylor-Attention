@@ -128,53 +128,50 @@ The `HybridTaylorAttentionBackend` node patches Flux's attention function at run
 - Quality stats logs include the hybrid config parameters used for the run.
 - When `log_quality_stats` is enabled, the results are also appended to `output/hybrid-attention-results.jsonl` with config + meta (sigma, shapes, inferred latent resolution, etc.).
 
-## Flux2TTR (Distilled TTR Attention)
+## Flux2TTR v2 Nodes
 
-The `Flux2TTR` node now uses a **hybrid kernel-regression attention** replacement for Flux single blocks:
+Flux2TTR is now split into four nodes:
 
-- Branch A: normalized kernel regression attention (positive feature map, fp32 KV/Ksum accumulation, chunked by query/key).
-- Branch B: exact softmax residual over a small landmark set (learnable gate `alpha`).
-- Final output: `kernel_out + alpha * landmark_out`.
+- `Flux2TTRTrainingParameters`: emits a shared `TTR_TRAINING_CONFIG` dict with:
+  - `loss_config` (`rmse_weight`, `cosine_weight`, `lpips_weight`, `huber_beta`)
+  - `optimizer_config` (`learning_rate`, `grad_clip_norm`, `alpha_lr_multiplier`, `phi_lr_multiplier`)
+  - `schedule_config` (`target_ttr_ratio`, `gumbel_temperature_start`, `gumbel_temperature_end`, `warmup_steps`)
+  - `logging_config` (`comet_enabled`, `comet_api_key`, `comet_project_name`, `comet_workspace`, `log_every`)
 
-- Inputs:
-  - `model` (`MODEL`)
-  - `latents` (`LATENT`) and `conditioning` (`CONDITIONING`) (kept for workflow compatibility; calibration now uses real runtime capture mode)
-  - `learning_rate`, `steps` (default `512`)
-  - `training` toggle
-  - `training_preview_ttr` (when training, emit student/TTR output for preview instead of teacher passthrough)
-  - `comet_enabled`, `comet_project_name`, `comet_workspace`, `comet_api_key` (optional Comet telemetry)
-  - `checkpoint_path`
-  - `feature_dim` (must be a multiple of 256 and at least 128)
-  - `query_chunk_size`, `key_chunk_size`
-  - `landmark_count`, `text_tokens_guess`
-  - `alpha_init`, `alpha_lr_multiplier`, `phi_lr_multiplier`
-  - `training_query_token_cap`, `replay_buffer_size`, `replay_offload_cpu`, `replay_max_mb`, `train_steps_per_call`
-  - `huber_beta`, `grad_clip_norm`
-  - `readiness_threshold`, `readiness_min_updates`
-  - `layer_start` / `layer_end` (optional single-block index range to patch)
-  - `cfg_scale` (default CFG when runtime options do not expose it)
-  - `min_swap_layers`, `max_swap_layers` (training-only randomized per-step layer swaps within eligible layer range)
-  - `inference_mixed_precision` (use bf16/fp16 inference path on CUDA)
-  - `controller_checkpoint_path` (optional Phase-2 controller for inference-time teacher-vs-TTR routing)
-- Outputs:
-  - patched `MODEL` with Flux attention routed through per-layer HKR student modules
-  - `loss_value` from load/runtime state
+- `Flux2TTRTrainer` (renamed from `Flux2TTR`): Phase-1 online distillation of TTR layers.
+  - Accepts optional `training_config` for shared hyperparameters.
+  - If `training_config` is not connected, it falls back to legacy defaults for backward compatibility.
+  - Outputs: patched `MODEL` + `loss_value`.
 
-Behavior:
-- `training=true`: runs online distillation during sampler execution, with **query-only subsampling** (`q_sub`) and **full k/v context** for student forward passes. Samples are stored in per-layer replay buffers and optimized with Smooth-L1/Huber loss.
-- During training, per-step layer selection is now randomized: only a sampled subset of eligible layers (`min_swap_layers..max_swap_layers`) receives TTR replay updates on that step; non-selected layers stay on teacher output.
-- `training=false`: loads checkpointed HKR layers and uses student attention only for layers that pass readiness checks.
-- HKR student layers now support sigma/CFG conditioning via a tiny layer-level conditioner MLP that modulates kernel and landmark branches (`sigma=None` keeps identity behavior).
-- Readiness is tracked per layer via EMA loss + minimum update count. Layers that are not ready fall back to native Flux attention.
-- Unsupported full per-query masks (`[B,H,Nq,Nk]` style) explicitly fail closed to native attention.
-- During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `Flux2HKRAttnLayer` instances keyed by `block_index`.
-- If a controller checkpoint is provided, inference can dynamically choose per layer whether to use full/native attention or TTR output based on `(sigma, cfg_scale, resolution)` with per-step mask caching.
-- Phase-2 `ControllerTrainer.train_step` now requires a `student_forward_fn(mask, logits)` callback so reconstruction loss gradients can flow through controller mask decisions (instead of training on detached precomputed student latents).
-- Checkpoint format is `flux2_ttr_v2` and stores layer weights plus readiness/EMA metadata for fail-closed inference.
-- When Comet logging is enabled, Flux2TTR logs per-layer distillation metrics (loss/mse/nmse/cosine/ema/ready plus sigma/cfg/layer-swap stats) every 50 updates by default (and on the final update).
-- Comet logging now also emits global cross-layer distribution stats on the same interval:
-  - `flux2ttr/global/{loss|mse|nmse|cosine_similarity|ema_loss}_{min|p25|p50|p75|max}`
-  - plus `layers_tracked`, `layers_ready`, and `layers_ready_ratio`.
+- `Flux2TTRControllerTrainer`: Phase-2 controller training.
+  - Runs dual-path sampling (`model_original` teacher vs `model_ttr` student).
+  - Computes RMSE/cosine/LPIPS quality delta and updates controller with REINFORCE.
+  - Uses fixed per-run `controller_mask_override` during patched sampling.
+  - Outputs: `IMAGE_ORIGINAL`, `IMAGE_PATCHED`, and `TTR_CONTROLLER`.
+
+- `Flux2TTRController`: inference-time patch node.
+  - Loads TTR + controller checkpoints and patches the model for dynamic routing.
+  - Adds `quality_speed` slider:
+    - `0.0 -> threshold 0.1` (favor TTR/speed)
+    - `0.5 -> threshold 0.5` (balanced)
+    - `1.0 -> threshold 0.9` (favor full attention/quality)
+  - Output: patched `MODEL`.
+
+Training flow:
+- `Flux2TTRTrainingParameters -> Flux2TTRTrainer`
+- `Flux2TTRTrainingParameters -> Flux2TTRControllerTrainer`
+
+Inference flow:
+- `MODEL -> Flux2TTRController -> KSampler`
+
+Implementation details:
+- `flux2_ttr.run_attention` now supports:
+  - `controller_mask_override` (precomputed mask injection)
+  - `controller_threshold` (quality/speed slider boundary)
+- `ControllerTrainer` now supports:
+  - `training_config` parsing
+  - REINFORCE policy updates via `reinforce_step`
+  - reward baseline EMA and gradient clipping
 
 Speed tips:
 - Distill once, then run with `training=false` for normal sampling.

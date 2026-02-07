@@ -315,6 +315,112 @@ def test_runtime_inference_controller_mask_routes_teacher_vs_student(monkeypatch
     assert torch.all(out1 == 42.0)
 
 
+def test_runtime_inference_controller_mask_override_routes_without_controller_call(monkeypatch):
+    class _Controller(torch.nn.Module):
+        def forward(self, sigma, cfg_scale, width, height):
+            del sigma, cfg_scale, width, height
+            raise AssertionError("controller should not be called when override mask is provided")
+
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime.register_layer_specs(
+        [
+            flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4),
+            flux2_ttr.FluxLayerSpec(layer_key="single:1", num_heads=2, head_dim=4),
+        ]
+    )
+    runtime.layer_update_count["single:0"] = 99
+    runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ready["single:0"] = True
+    runtime.layer_update_count["single:1"] = 99
+    runtime.layer_ema_loss["single:1"] = 0.0
+    runtime.layer_ready["single:1"] = True
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    def fake_student(**kwargs):
+        q_eff = kwargs["q_eff"]
+        v_arg = kwargs["v"]
+        return torch.full((q_eff.shape[0], q_eff.shape[2], q_eff.shape[1] * q_eff.shape[3]), 11.0, dtype=v_arg.dtype)
+
+    monkeypatch.setattr(runtime, "_student_from_runtime", fake_student)
+    teacher = fallback(q, k, v, None)
+    controller = _Controller()
+    mask_override = torch.tensor([1.0, 0.0], dtype=torch.float32)
+
+    opts0 = {
+        "block_type": "single",
+        "block_index": 0,
+        "flux2_ttr": {"controller": controller, "controller_mask_override": mask_override},
+    }
+    opts1 = {
+        "block_type": "single",
+        "block_index": 1,
+        "flux2_ttr": {"controller": controller, "controller_mask_override": mask_override},
+    }
+
+    out0 = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts0, fallback_attention=fallback)
+    out1 = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts1, fallback_attention=fallback)
+    assert torch.allclose(out0, teacher)
+    assert torch.all(out1 == 11.0)
+
+
+def test_runtime_inference_controller_threshold_is_configurable(monkeypatch):
+    class _Controller(torch.nn.Module):
+        def forward(self, sigma, cfg_scale, width, height):
+            del sigma, cfg_scale, width, height
+            # sigmoid(logit(0.6)) -> 0.6 mask probability
+            return torch.tensor([torch.logit(torch.tensor(0.6)).item()], dtype=torch.float32)
+
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+    runtime.layer_update_count["single:0"] = 99
+    runtime.layer_ema_loss["single:0"] = 0.0
+    runtime.layer_ready["single:0"] = True
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    def fake_student(**kwargs):
+        q_eff = kwargs["q_eff"]
+        v_arg = kwargs["v"]
+        return torch.full((q_eff.shape[0], q_eff.shape[2], q_eff.shape[1] * q_eff.shape[3]), 24.0, dtype=v_arg.dtype)
+
+    monkeypatch.setattr(runtime, "_student_from_runtime", fake_student)
+    controller = _Controller()
+    teacher = fallback(q, k, v, None)
+
+    opts_threshold_high = {
+        "block_type": "single",
+        "block_index": 0,
+        "flux2_ttr": {"controller": controller, "controller_threshold": 0.7},
+    }
+    opts_threshold_low = {
+        "block_type": "single",
+        "block_index": 0,
+        "flux2_ttr": {"controller": controller, "controller_threshold": 0.5},
+    }
+
+    out_student = runtime.run_attention(
+        q, k, v, pe=None, mask=None, transformer_options=opts_threshold_high, fallback_attention=fallback
+    )
+    out_teacher = runtime.run_attention(
+        q, k, v, pe=None, mask=None, transformer_options=opts_threshold_low, fallback_attention=fallback
+    )
+    assert torch.all(out_student == 24.0)
+    assert torch.allclose(out_teacher, teacher)
+
+
 def test_runtime_unsupported_mask_falls_back_to_teacher():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)

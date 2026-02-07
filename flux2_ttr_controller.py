@@ -140,15 +140,30 @@ class ControllerTrainer:
         self,
         controller: TTRController,
         *,
+        training_config: Optional[Dict[str, Any]] = None,
         learning_rate: float = 1e-3,
         rmse_weight: float = 1.0,
         cosine_weight: float = 1.0,
         lpips_weight: float = 0.0,
         target_ttr_ratio: float = 0.7,
+        grad_clip_norm: float = 1.0,
         device: Optional[torch.device] = None,
     ):
         if not isinstance(controller, TTRController):
             raise TypeError("ControllerTrainer expects a TTRController instance.")
+
+        if training_config is not None:
+            loss_cfg = training_config.get("loss_config", {}) if isinstance(training_config, dict) else {}
+            opt_cfg = training_config.get("optimizer_config", {}) if isinstance(training_config, dict) else {}
+            sched_cfg = training_config.get("schedule_config", {}) if isinstance(training_config, dict) else {}
+
+            rmse_weight = float(loss_cfg.get("rmse_weight", rmse_weight))
+            cosine_weight = float(loss_cfg.get("cosine_weight", cosine_weight))
+            lpips_weight = float(loss_cfg.get("lpips_weight", lpips_weight))
+            target_ttr_ratio = float(sched_cfg.get("target_ttr_ratio", target_ttr_ratio))
+            learning_rate = float(opt_cfg.get("learning_rate", learning_rate))
+            grad_clip_norm = float(opt_cfg.get("grad_clip_norm", grad_clip_norm))
+
         self.controller = controller
         if device is not None:
             self.controller.to(device=device)
@@ -158,6 +173,10 @@ class ControllerTrainer:
         self.cosine_weight = float(cosine_weight)
         self.lpips_weight = float(lpips_weight)
         self.target_ttr_ratio = float(target_ttr_ratio)
+        self.grad_clip_norm = max(0.0, float(grad_clip_norm))
+        self._reward_baseline = 0.0
+        self._reward_count = 0
+        self._train_step_warned = False
         self.lpips_model = None
         if self.lpips_weight > 0:
             try:
@@ -171,6 +190,15 @@ class ControllerTrainer:
                 raise RuntimeError(
                     "ControllerTrainer: lpips_weight > 0 requires the 'lpips' package."
                 ) from exc
+        logger.info(
+            "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g target_ratio=%.4g grad_clip=%.4g",
+            float(learning_rate),
+            self.rmse_weight,
+            self.cosine_weight,
+            self.lpips_weight,
+            self.target_ttr_ratio,
+            self.grad_clip_norm,
+        )
 
     @staticmethod
     def _cosine_distance(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
@@ -210,6 +238,7 @@ class ControllerTrainer:
         actual_full_attn_ratio: float | torch.Tensor,
         teacher_rgb: Optional[torch.Tensor] = None,
         student_rgb: Optional[torch.Tensor] = None,
+        include_efficiency_penalty: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         teacher = teacher_latent.float()
         student = student_latent.float()
@@ -235,7 +264,8 @@ class ControllerTrainer:
             dtype=loss.dtype,
         )
         efficiency_penalty = torch.relu(ratio - float(self.target_ttr_ratio))
-        loss = loss + efficiency_penalty
+        if include_efficiency_penalty:
+            loss = loss + efficiency_penalty
 
         metrics = {
             "loss": float(loss.detach().item()),
@@ -247,6 +277,66 @@ class ControllerTrainer:
             "target_ttr_ratio": float(self.target_ttr_ratio),
         }
         return loss, metrics
+
+    def _update_reward_baseline(self, reward: float, decay: float = 0.95) -> None:
+        self._reward_count += 1
+        reward_f = float(reward)
+        if self._reward_count == 1:
+            self._reward_baseline = reward_f
+        else:
+            self._reward_baseline = decay * self._reward_baseline + (1.0 - decay) * reward_f
+
+    def reinforce_step(
+        self,
+        *,
+        sigma: float,
+        cfg_scale: float,
+        width: int,
+        height: int,
+        sampled_mask: torch.Tensor,
+        reward: float,
+        actual_full_attn_ratio: float,
+    ) -> Dict[str, float]:
+        self.controller.train()
+        logits = self.controller(sigma=sigma, cfg_scale=cfg_scale, width=width, height=height)
+        probs = torch.sigmoid(logits)
+
+        mask = sampled_mask.to(device=logits.device, dtype=logits.dtype).reshape(-1).detach()
+        if mask.numel() != probs.numel():
+            raise ValueError(
+                "ControllerTrainer.reinforce_step: sampled_mask length "
+                f"{int(mask.numel())} does not match controller layer count {int(probs.numel())}."
+            )
+
+        log_probs = mask * torch.log(probs + 1e-8) + (1.0 - mask) * torch.log(1.0 - probs + 1e-8)
+        total_log_prob = log_probs.sum()
+
+        reward_value = float(reward)
+        baselined_reward = reward_value - self._reward_baseline
+        self._update_reward_baseline(reward_value)
+
+        policy_loss = -baselined_reward * total_log_prob
+        efficiency_penalty = torch.relu(probs.mean() - float(self.target_ttr_ratio))
+        loss = policy_loss + efficiency_penalty
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if self.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
+        self.optimizer.step()
+
+        return {
+            "policy_loss": float(policy_loss.detach().item()),
+            "efficiency_penalty": float(efficiency_penalty.detach().item()),
+            "total_loss": float(loss.detach().item()),
+            "reward": reward_value,
+            "reward_baseline": float(self._reward_baseline),
+            "baselined_reward": float(baselined_reward),
+            "mask_mean": float(mask.mean().item()),
+            "probs_mean": float(probs.detach().mean().item()),
+            "actual_full_attn_ratio": float(actual_full_attn_ratio),
+            "target_ttr_ratio": float(self.target_ttr_ratio),
+        }
 
     def train_step(
         self,
@@ -261,6 +351,11 @@ class ControllerTrainer:
         gumbel_temperature: float = 1.0,
         hard_mask: bool = True,
     ) -> Dict[str, float]:
+        if not self._train_step_warned:
+            logger.warning(
+                "ControllerTrainer.train_step is deprecated; prefer reinforce_step for policy-gradient training."
+            )
+            self._train_step_warned = True
         if not callable(student_forward_fn):
             raise TypeError("ControllerTrainer.train_step requires a callable student_forward_fn(mask, logits).")
         self.controller.train()
@@ -286,6 +381,8 @@ class ControllerTrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if self.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.controller.parameters(), self.grad_clip_norm)
         self.optimizer.step()
 
         metrics["mask_mean"] = float(mask.detach().mean().item())

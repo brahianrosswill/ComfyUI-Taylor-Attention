@@ -1856,18 +1856,34 @@ class Flux2TTRRuntime:
                 return teacher_out
 
         controller = None
+        controller_mask_override = None
+        controller_threshold = 0.5
         if isinstance(transformer_options, dict):
             cfg = transformer_options.get("flux2_ttr")
             if isinstance(cfg, dict):
                 controller = cfg.get("controller")
-        if controller is not None:
+                controller_mask_override = cfg.get("controller_mask_override")
+                try:
+                    threshold_value = float(cfg.get("controller_threshold", 0.5))
+                    if math.isfinite(threshold_value):
+                        controller_threshold = threshold_value
+                except Exception:
+                    controller_threshold = 0.5
+        if controller_mask_override is not None or controller is not None:
             width, height = self._extract_resolution(
                 transformer_options,
                 n_key=int(k.shape[2]),
                 text_token_count=text_token_count,
             )
             try:
-                controller_mask = self._get_controller_mask(controller, sigma, cfg_scale, width, height)
+                if controller_mask_override is not None:
+                    controller_mask = torch.as_tensor(
+                        controller_mask_override,
+                        device=q.device,
+                        dtype=torch.float32,
+                    ).reshape(-1)
+                else:
+                    controller_mask = self._get_controller_mask(controller, sigma, cfg_scale, width, height)
                 layer_idx = self._extract_layer_index(layer_key)
                 if layer_idx is None or layer_idx < 0 or layer_idx >= int(controller_mask.numel()):
                     logger.warning(
@@ -1885,7 +1901,7 @@ class Flux2TTRRuntime:
                         mask,
                         transformer_options,
                     )
-                use_full_attention = bool(float(controller_mask[layer_idx].item()) > 0.5)
+                use_full_attention = bool(float(controller_mask[layer_idx].item()) > float(controller_threshold))
             except Exception as exc:
                 logger.warning("Flux2TTR: controller evaluation failed on %s (%s); using teacher fallback.", layer_key, exc)
                 return teacher_out if teacher_out is not None else self._teacher_from_fallback(
