@@ -164,9 +164,16 @@ class ControllerTrainer:
             learning_rate = float(opt_cfg.get("learning_rate", learning_rate))
             grad_clip_norm = float(opt_cfg.get("grad_clip_norm", grad_clip_norm))
 
+        if self._module_contains_inference_tensors(controller):
+            logger.warning(
+                "ControllerTrainer: controller parameters were created under inference mode; rebuilding trainable copy."
+            )
+            controller = self._rebuild_controller_trainable_copy(controller)
+
         self.controller = controller
         if device is not None:
-            self.controller.to(device=device)
+            with torch.inference_mode(False):
+                self.controller.to(device=device)
 
         self.optimizer = torch.optim.AdamW(self.controller.parameters(), lr=float(learning_rate))
         self.rmse_weight = float(rmse_weight)
@@ -199,6 +206,39 @@ class ControllerTrainer:
             self.target_ttr_ratio,
             self.grad_clip_norm,
         )
+
+    @staticmethod
+    def _is_inference_tensor(t: torch.Tensor) -> bool:
+        checker = getattr(t, "is_inference", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return False
+
+    @classmethod
+    def _module_contains_inference_tensors(cls, module: nn.Module) -> bool:
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            if cls._is_inference_tensor(tensor):
+                return True
+        return False
+
+    @staticmethod
+    def _clone_state_dict_tensors(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return {k: v.detach().clone() if torch.is_tensor(v) else v for k, v in state_dict.items()}
+
+    @classmethod
+    def _rebuild_controller_trainable_copy(cls, controller: TTRController) -> TTRController:
+        with torch.inference_mode(False):
+            rebuilt = TTRController(
+                num_layers=int(controller.num_layers),
+                embed_dim=int(controller.embed_dim),
+                hidden_dim=int(controller.hidden_dim),
+            )
+            state = cls._clone_state_dict_tensors(controller.state_dict())
+            rebuilt.load_state_dict(state, strict=True)
+        return rebuilt
 
     @staticmethod
     def _cosine_distance(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:

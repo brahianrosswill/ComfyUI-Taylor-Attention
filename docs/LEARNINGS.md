@@ -76,3 +76,4 @@
 - For VAE socket compatibility, some builds expose `io.Vae` (camel case) instead of `io.VAE`; checking both keeps node schemas portable.
 - Seed-sweep workflows are easier to build with a dedicated deterministic seed-batch node (`RandomSeedBatch`) instead of overloading float sweep nodes for integer seed generation.
 - Controller optimization steps must explicitly run inside `torch.inference_mode(False)` + `torch.enable_grad()` because ComfyUI may execute custom-node code under inference mode, which otherwise strips the grad graph and breaks `loss.backward()`.
+- When controller modules themselves are constructed/loaded under inference mode, their parameters can become inference tensors; rebuilding a trainable copy from state_dict inside `inference_mode(False)` avoids backward failures in linear layers.
