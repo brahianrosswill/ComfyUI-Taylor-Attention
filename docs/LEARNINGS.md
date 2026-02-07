@@ -72,3 +72,4 @@
 - Comet rate limiting is avoided by throttling Flux2TTR metric submissions to a fixed cadence (50 updates by default) while still logging final-step metrics.
 - Controller training must execute student sampling as a differentiable function of controller mask/logits; passing precomputed student latents into trainer steps disconnects RMSE/cosine/LPIPS losses from controller gradients.
 - Flux2TTR training/inference UX is cleaner when shared hyperparameters are emitted as a typed config object (`TTR_TRAINING_CONFIG`) and consumed by both phase nodes, while `run_attention` honors `controller_mask_override` and `controller_threshold` for controller training and quality/speed inference control.
+- Some ComfyUI `comfy_api.latest` builds do not expose `io.VAE`; node schemas should use a compatibility fallback (`AnyType`) to keep extension loading across API variants.

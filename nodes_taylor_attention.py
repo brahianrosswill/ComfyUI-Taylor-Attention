@@ -146,6 +146,14 @@ def _extract_layer_idx(layer_key: str) -> Optional[int]:
         return None
 
 
+def _vae_input(name: str, *, tooltip: Optional[str] = None):
+    vae_type = getattr(io, "VAE", None)
+    if vae_type is not None and hasattr(vae_type, "Input"):
+        return vae_type.Input(name, tooltip=tooltip)
+    logger.warning("Flux2TTR: io.VAE is unavailable in this ComfyUI API build; using AnyType input for '%s'.", name)
+    return io.AnyType.Input(name, tooltip=tooltip)
+
+
 def _resolve_ttr_runtime_from_model(model_ttr) -> tuple[flux2_ttr.Flux2TTRRuntime, dict]:
     transformer_options = model_ttr.model_options.setdefault("transformer_options", {})
     cfg = transformer_options.get("flux2_ttr")
@@ -1261,7 +1269,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
                 io.Latent.Input("latent"),
-                io.VAE.Input("vae"),
+                _vae_input("vae"),
                 TTRTrainingConfig.Input("training_config"),
                 io.Int.Input("steps", default=20, min=1, max=10000, step=1),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, step=1),
