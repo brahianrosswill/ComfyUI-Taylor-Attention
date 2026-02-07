@@ -1,4 +1,5 @@
 import math
+import logging
 
 import pytest
 import torch
@@ -265,6 +266,32 @@ def test_high_loss_inference_falls_back_to_teacher():
     baseline = fallback(q, k, v, None)
     out = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
     assert torch.allclose(out, baseline)
+
+
+def test_training_progress_logs_every_10_updates(caplog):
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=10)
+    runtime.training_mode = True
+    runtime.training_enabled = True
+    runtime.training_steps_total = 10
+    runtime.training_updates_done = 0
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=1, head_dim=4)])
+
+    q = torch.randn(1, 1, 8, 4)
+    k = torch.randn(1, 1, 8, 4)
+    v = torch.randn(1, 1, 8, 4)
+    opts = {"block_type": "single", "block_index": 0}
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, mask, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg)
+
+    caplog.set_level(logging.INFO, logger="flux2_ttr")
+    for _ in range(10):
+        runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+
+    assert runtime.training_updates_done == 10
+    assert "Flux2TTR distill progress: updates=10/10" in caplog.text
 
 
 def test_runtime_checkpoint_round_trip(tmp_path):

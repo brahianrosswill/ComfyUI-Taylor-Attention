@@ -600,7 +600,9 @@ class Flux2TTR(io.ComfyNode):
                 runtime.load_checkpoint(checkpoint_path)
             runtime.training_mode = True
             runtime.training_enabled = train_steps > 0
+            runtime.training_steps_total = max(0, train_steps)
             runtime.steps_remaining = max(0, train_steps)
+            runtime.training_updates_done = 0
             loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
         else:
             if not checkpoint_path:
@@ -610,7 +612,9 @@ class Flux2TTR(io.ComfyNode):
             runtime.load_checkpoint(checkpoint_path)
             runtime.training_mode = False
             runtime.training_enabled = False
+            runtime.training_steps_total = 0
             runtime.steps_remaining = 0
+            runtime.training_updates_done = 0
             loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
 
         runtime_id = flux2_ttr.register_runtime(runtime)

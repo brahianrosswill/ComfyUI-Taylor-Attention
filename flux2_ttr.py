@@ -397,6 +397,9 @@ class Flux2TTRRuntime:
         self.training_mode = bool(training)
         self.training_enabled = bool(training)
         self.steps_remaining = max(0, int(steps))
+        self.training_steps_total = max(0, int(steps))
+        self.training_updates_done = 0
+        self.training_log_every = 10
         self.scan_chunk_size = max(1, int(scan_chunk_size))
         self.training_scan_chunk_size = max(1, min(self.scan_chunk_size, _TRAINING_SCAN_CHUNK_CAP))
         self.training_token_cap = int(_TRAINING_TOKEN_CAP)
@@ -657,6 +660,22 @@ class Flux2TTRRuntime:
                             optimizer.step()
                     self.last_loss = float(loss.item())
                     self.steps_remaining -= 1
+                    self.training_updates_done += 1
+                    if (
+                        self.training_log_every > 0
+                        and (
+                            self.training_updates_done % self.training_log_every == 0
+                            or self.steps_remaining <= 0
+                        )
+                    ):
+                        logger.info(
+                            "Flux2TTR distill progress: updates=%d/%d loss=%.6g layer=%s remaining=%d",
+                            self.training_updates_done,
+                            max(self.training_steps_total, self.training_updates_done),
+                            self.last_loss,
+                            layer_key,
+                            self.steps_remaining,
+                        )
                     if self.steps_remaining <= 0:
                         self.training_enabled = False
                         logger.info("Flux2TTR: online distillation reached configured steps; continuing teacher passthrough for this run.")

@@ -166,6 +166,7 @@ Speed tips:
 - Flux2TTR now remembers smaller per-layer chunk sizes after OOM retries so it does not repeat the same failing chunk each call.
 - If training still OOMs, Flux2TTR disables training for the run and continues in teacher passthrough mode instead of crashing generation.
 - If checkpoint loss is still high, Flux2TTR will fail closed to native attention fallback in inference mode instead of emitting low-quality garbage output.
+- During online distillation, Flux2TTR logs progress every 10 training updates with current loss so you can tune `steps`.
 
 ## Clocked Sweep Values
 
