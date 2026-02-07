@@ -137,6 +137,7 @@ The `Flux2TTR` node adds a train/load workflow for replacing Flux single-block a
   - `latents` (`LATENT`) and `conditioning` (`CONDITIONING`) for calibration data
   - `learning_rate`, `steps` (default `512`)
   - `training` toggle
+  - `training_preview_ttr` (when training, emit student/TTR output for preview instead of teacher passthrough)
   - `checkpoint_path`
   - `feature_dim` (must be a multiple of 256 and at least 128)
   - `scan_chunk_size` (token chunk size for the vectorized scan path)
@@ -147,7 +148,7 @@ The `Flux2TTR` node adds a train/load workflow for replacing Flux single-block a
   - `loss_value` from calibration/load state
 
 Behavior:
-- `training=true`: runs online distillation during the sampler run using native Flux attention as the teacher (`MSE(student, native_attention)`), and automatically saves to `checkpoint_path` at model cleanup when provided.
+- `training=true`: runs online distillation during the sampler run using native Flux attention as the teacher (`MSE(student, native_attention)`), and automatically saves to `checkpoint_path` at model cleanup when provided. By default it also previews student/TTR outputs during training (`training_preview_ttr=true`).
 - `training=false`: loads TTR weights from `checkpoint_path` and enables inference with TTR attention.
 - During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `TTRFluxLayer` instances keyed by `block_index`.
 - Inference uses a chunked vectorized scan instead of token-by-token Python loops for better throughput.
@@ -166,9 +167,10 @@ Speed tips:
 - Training at `feature_dim=256` typically needs roughly a few GB of extra VRAM; reservation is intended to offload earlier nodes before TTR allocates.
 - If a scan chunk still OOMs, Flux2TTR automatically retries with smaller chunk sizes (`512 -> 256 -> 128 -> ...`) until it fits.
 - Flux2TTR now remembers smaller per-layer chunk sizes after OOM retries so it does not repeat the same failing chunk each call.
-- If training still OOMs, Flux2TTR disables training for the run and continues in teacher passthrough mode instead of crashing generation.
+- If training still OOMs, Flux2TTR disables training for the run and falls back gracefully (teacher passthrough or preview fallback) instead of crashing generation.
 - If checkpoint loss is still high, Flux2TTR will fail closed to native attention fallback in inference mode instead of emitting low-quality garbage output.
 - During online distillation, Flux2TTR logs progress every 10 training updates with current loss so you can tune `steps`.
+- If you only want fastest distillation and don't need visual feedback, set `training_preview_ttr=false` to stay in teacher passthrough during training runs.
 
 ## Clocked Sweep Values
 

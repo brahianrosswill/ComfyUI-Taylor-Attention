@@ -505,6 +505,11 @@ class Flux2TTR(io.ComfyNode):
                 io.Float.Input("learning_rate", default=1e-4, min=1e-7, max=1.0, step=1e-7),
                 io.Int.Input("steps", default=512, min=0, max=200000, step=1),
                 io.Boolean.Input("training", default=True, tooltip="Train TTR layers by distillation when enabled."),
+                io.Boolean.Input(
+                    "training_preview_ttr",
+                    default=True,
+                    tooltip="When training, output TTR student attention for visual preview instead of teacher passthrough.",
+                ),
                 io.String.Input(
                     "checkpoint_path",
                     default="",
@@ -562,6 +567,7 @@ class Flux2TTR(io.ComfyNode):
         learning_rate: float,
         steps: int,
         training: bool,
+        training_preview_ttr: bool,
         checkpoint_path: str,
         feature_dim: int,
         scan_chunk_size: int,
@@ -591,6 +597,7 @@ class Flux2TTR(io.ComfyNode):
             layer_start=int(layer_start),
             layer_end=int(layer_end),
             inference_mixed_precision=bool(inference_mixed_precision),
+            training_preview_ttr=bool(training_preview_ttr),
         )
         runtime.register_layer_specs(flux2_ttr.infer_flux_single_layer_specs(m))
 
@@ -623,6 +630,7 @@ class Flux2TTR(io.ComfyNode):
             "runtime_id": runtime_id,
             "training": runtime.training_enabled,
             "training_mode": runtime.training_mode,
+            "training_preview_ttr": runtime.training_preview_ttr,
             "training_steps_total": int(runtime.training_steps_total),
             "training_steps_remaining": int(runtime.steps_remaining),
             "learning_rate": float(learning_rate),
@@ -650,8 +658,9 @@ class Flux2TTR(io.ComfyNode):
         )
 
         logger.info(
-            "Flux2TTR configured: training_mode=%s training_steps=%d feature_dim=%d scan_chunk_size=%d layer_range=[%d,%d] mixed_precision=%s checkpoint=%s loss=%.6g",
+            "Flux2TTR configured: training_mode=%s training_preview_ttr=%s training_steps=%d feature_dim=%d scan_chunk_size=%d layer_range=[%d,%d] mixed_precision=%s checkpoint=%s loss=%.6g",
             training,
+            bool(training_preview_ttr),
             train_steps,
             feature_dim,
             int(scan_chunk_size),

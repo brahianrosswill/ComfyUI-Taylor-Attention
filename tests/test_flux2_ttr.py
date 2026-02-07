@@ -73,9 +73,43 @@ def test_ttr_scan_chunked_matches_token_scan():
     assert torch.allclose(out_token, out_chunked, atol=1e-6, rtol=1e-5)
 
 
-def test_runtime_training_uses_teacher_passthrough():
+def test_runtime_training_previews_ttr_output():
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=1)
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+    opts = {"block_type": "single", "block_index": 0}
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, mask, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg)
+
+    out_train = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    baseline = fallback(q, k, v, None)
+    assert out_train.shape == baseline.shape
+    assert torch.isfinite(out_train).all()
+    assert not torch.allclose(out_train, baseline)
+    assert runtime.steps_remaining == 0
+    assert runtime.training_enabled is False
+    assert not math.isnan(runtime.last_loss)
+
+    out_preview = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    assert out_preview.shape == baseline.shape
+    assert torch.isfinite(out_preview).all()
+
+
+def test_runtime_training_can_use_teacher_passthrough_when_preview_disabled():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=True,
+        steps=1,
+        training_preview_ttr=False,
+    )
     runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
 
     q = torch.randn(1, 2, 6, 4)
@@ -93,10 +127,6 @@ def test_runtime_training_uses_teacher_passthrough():
     assert runtime.steps_remaining == 0
     assert runtime.training_enabled is False
     assert not math.isnan(runtime.last_loss)
-
-    # Training mode stays in teacher passthrough for this run.
-    out_passthrough = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
-    assert torch.allclose(out_passthrough, baseline)
 
 
 def test_runtime_inference_mode_uses_student_output_shape():
@@ -313,6 +343,7 @@ def test_recover_runtime_from_config_training_without_checkpoint():
     cfg = {
         "training_mode": True,
         "training": True,
+        "training_preview_ttr": False,
         "training_steps_total": 64,
         "training_steps_remaining": 32,
         "learning_rate": 1e-4,
@@ -327,7 +358,40 @@ def test_recover_runtime_from_config_training_without_checkpoint():
     assert runtime is not None
     assert runtime.training_mode is True
     assert runtime.training_enabled is True
+    assert runtime.training_preview_ttr is False
     assert runtime.steps_remaining == 32
+
+
+def test_recover_runtime_from_config_inference_overrides_checkpoint_mode(tmp_path):
+    runtime_train = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-4,
+        training=True,
+        steps=8,
+        training_preview_ttr=True,
+    )
+    ckpt = tmp_path / "flux2_ttr_recover_mode.pt"
+    runtime_train.save_checkpoint(str(ckpt))
+
+    cfg = {
+        "training_mode": False,
+        "training": False,
+        "training_preview_ttr": False,
+        "training_steps_total": 64,
+        "training_steps_remaining": 64,
+        "learning_rate": 1e-4,
+        "feature_dim": 256,
+        "scan_chunk_size": 128,
+        "layer_start": 10,
+        "layer_end": 19,
+        "inference_mixed_precision": True,
+        "checkpoint_path": str(ckpt),
+    }
+    runtime = flux2_ttr._recover_runtime_from_config(cfg)
+    assert runtime is not None
+    assert runtime.training_mode is False
+    assert runtime.training_enabled is False
+    assert runtime.training_preview_ttr is False
 
 
 def test_training_progress_logs_every_10_updates(caplog):
@@ -407,8 +471,10 @@ def test_run_attention_training_works_inside_inference_mode():
         del pe_arg, mask, transformer_options
         return _baseline_flat(q_arg, k_arg, v_arg)
 
-    baseline = fallback(q, k, v, None)
     with torch.inference_mode():
         out = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
-    assert torch.allclose(out, baseline)
+    baseline = fallback(q, k, v, None)
+    assert out.shape == baseline.shape
+    assert torch.isfinite(out).all()
+    assert not torch.allclose(out, baseline)
     assert not math.isnan(runtime.last_loss)

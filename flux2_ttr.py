@@ -391,6 +391,7 @@ class Flux2TTRRuntime:
         layer_start: int = -1,
         layer_end: int = -1,
         inference_mixed_precision: bool = True,
+        training_preview_ttr: bool = True,
     ):
         self.feature_dim = validate_feature_dim(feature_dim)
         self.learning_rate = float(learning_rate)
@@ -406,6 +407,7 @@ class Flux2TTRRuntime:
         self.layer_start = int(layer_start)
         self.layer_end = int(layer_end)
         self.inference_mixed_precision = bool(inference_mixed_precision)
+        self.training_preview_ttr = bool(training_preview_ttr)
         self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)
         self.last_loss = float("nan")
         self.layers: Dict[str, TTRFluxLayer] = {}
@@ -597,6 +599,46 @@ class Flux2TTRRuntime:
             return _flatten_heads(_softmax_attention(q.float(), k.float(), v.float(), mask=mask).to(dtype=v.dtype))
         return fallback_attention(q, k, v, pe, mask=mask, transformer_options=transformer_options)
 
+    def _student_from_runtime(
+        self,
+        q_eff: torch.Tensor,
+        k_eff: torch.Tensor,
+        v: torch.Tensor,
+        layer_key: str,
+        head_dim: int,
+        transformer_options: Optional[dict],
+        reserve_memory: bool = True,
+    ) -> torch.Tensor:
+        layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
+        layer.eval()
+        inference_dtype = self._resolve_inference_dtype(q_eff)
+        if reserve_memory:
+            _maybe_reserve_memory(
+                self,
+                q_eff,
+                transformer_options,
+                training=False,
+                dtype_accum=inference_dtype,
+                layer_key=layer_key,
+            )
+        self._set_layer_dtype(layer_key, layer, inference_dtype)
+        q_in = q_eff.to(dtype=inference_dtype)
+        k_in = k_eff.to(dtype=inference_dtype)
+        v_in = v.to(dtype=inference_dtype)
+        with torch.no_grad():
+            student = layer(
+                q_in,
+                k_in,
+                v_in,
+                chunk_size=self._effective_scan_chunk(training=False, layer_key=layer_key),
+            )
+        self._update_scan_chunk_override(
+            layer_key,
+            training=False,
+            used_chunk=getattr(layer, "last_used_scan_chunk", self._effective_scan_chunk(False, layer_key)),
+        )
+        return _flatten_heads(student).to(dtype=v.dtype)
+
     def run_attention(
         self,
         q: torch.Tensor,
@@ -704,13 +746,36 @@ class Flux2TTRRuntime:
                             cfg["training_updates_done"] = int(self.training_updates_done)
                     if self.steps_remaining <= 0:
                         self.training_enabled = False
-                        logger.info("Flux2TTR: online distillation reached configured steps; continuing teacher passthrough for this run.")
+                        logger.info(
+                            "Flux2TTR: online distillation reached configured steps; continuing %s for this run.",
+                            "TTR preview output" if self.training_preview_ttr else "teacher passthrough",
+                        )
                 except torch.OutOfMemoryError:
                     self.training_enabled = False
-                    logger.warning("Flux2TTR training OOM on layer %s; disabling training and continuing teacher passthrough.", layer_key)
+                    logger.warning(
+                        "Flux2TTR training OOM on layer %s; disabling training and continuing %s.",
+                        layer_key,
+                        "TTR preview output" if self.training_preview_ttr else "teacher passthrough",
+                    )
                     if q_eff.device.type == "cuda":
                         torch.cuda.empty_cache()
-            return teacher_out
+            if not self.training_preview_ttr:
+                return teacher_out
+            try:
+                return self._student_from_runtime(
+                    q_eff=q_eff,
+                    k_eff=k_eff,
+                    v=v,
+                    layer_key=layer_key,
+                    head_dim=head_dim,
+                    transformer_options=transformer_options,
+                    reserve_memory=False,
+                )
+            except torch.OutOfMemoryError:
+                logger.warning("Flux2TTR preview OOM on layer %s; falling back to teacher output for this call.", layer_key)
+                if q_eff.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                return teacher_out
 
         if (
             math.isfinite(self.last_loss)
@@ -726,35 +791,14 @@ class Flux2TTRRuntime:
                 self._warned_high_loss = True
             return self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
 
-        layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
-        layer.eval()
-        inference_dtype = self._resolve_inference_dtype(q_eff)
-        _maybe_reserve_memory(
-            self,
-            q_eff,
-            transformer_options,
-            training=False,
-            dtype_accum=inference_dtype,
+        return self._student_from_runtime(
+            q_eff=q_eff,
+            k_eff=k_eff,
+            v=v,
             layer_key=layer_key,
+            head_dim=head_dim,
+            transformer_options=transformer_options,
         )
-        self._set_layer_dtype(layer_key, layer, inference_dtype)
-        q_in = q_eff.to(dtype=inference_dtype)
-        k_in = k_eff.to(dtype=inference_dtype)
-        v_in = v.to(dtype=inference_dtype)
-        with torch.no_grad():
-            student = layer(
-                q_in,
-                k_in,
-                v_in,
-                chunk_size=self._effective_scan_chunk(training=False, layer_key=layer_key),
-            )
-        self._update_scan_chunk_override(
-            layer_key,
-            training=False,
-            used_chunk=getattr(layer, "last_used_scan_chunk", self._effective_scan_chunk(False, layer_key)),
-        )
-        student_out = _flatten_heads(student).to(dtype=v.dtype)
-        return student_out
 
     def calibrate_from_inputs(
         self,
@@ -871,6 +915,7 @@ class Flux2TTRRuntime:
             "feature_dim": self.feature_dim,
             "learning_rate": self.learning_rate,
             "training_mode": self.training_mode,
+            "training_preview_ttr": self.training_preview_ttr,
             "last_loss": self.last_loss,
             "scan_chunk_size": self.scan_chunk_size,
             "training_scan_chunk_size": self.training_scan_chunk_size,
@@ -909,6 +954,7 @@ class Flux2TTRRuntime:
 
         self.learning_rate = float(payload.get("learning_rate", self.learning_rate))
         self.training_mode = bool(payload.get("training_mode", self.training_mode))
+        self.training_preview_ttr = bool(payload.get("training_preview_ttr", self.training_preview_ttr))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
         self.scan_chunk_size = max(1, int(payload.get("scan_chunk_size", self.scan_chunk_size)))
         self.training_scan_chunk_size = max(
@@ -964,6 +1010,7 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
     layer_start = int(cfg.get("layer_start", -1))
     layer_end = int(cfg.get("layer_end", -1))
     inference_mixed_precision = bool(cfg.get("inference_mixed_precision", True))
+    training_preview_ttr = bool(cfg.get("training_preview_ttr", True))
     training_mode = bool(cfg.get("training_mode", False))
     training_total = max(0, int(cfg.get("training_steps_total", 0)))
     training_remaining = max(0, int(cfg.get("training_steps_remaining", training_total)))
@@ -978,8 +1025,10 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
         layer_start=layer_start,
         layer_end=layer_end,
         inference_mixed_precision=inference_mixed_precision,
+        training_preview_ttr=training_preview_ttr,
     )
     runtime.training_mode = training_mode
+    runtime.training_preview_ttr = training_preview_ttr
     runtime.training_steps_total = training_total
     runtime.steps_remaining = training_remaining
     runtime.training_enabled = bool(cfg.get("training", False)) and training_remaining > 0
@@ -988,6 +1037,8 @@ def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
     checkpoint_path = (cfg.get("checkpoint_path") or "").strip()
     if checkpoint_path and os.path.isfile(checkpoint_path):
         runtime.load_checkpoint(checkpoint_path)
+        runtime.training_mode = training_mode
+        runtime.training_preview_ttr = training_preview_ttr
     elif not training_mode:
         logger.warning(
             "Flux2TTR: cannot recover inference runtime without a valid checkpoint_path (got %r).",

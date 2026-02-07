@@ -56,3 +56,4 @@
 - Adaptive scan chunking should be sticky per layer after an OOM retry; otherwise each attention call re-attempts known-failing chunk sizes and wastes time.
 - Distillation progress logs every fixed update interval (e.g., every 10 updates) are useful because Flux2TTR training steps are attention-call based, not sampler-step based.
 - Flux2TTR online distillation often needs hundreds of updates for usable loss; setting the node default to 512 steps is a better starting point than 32.
+- Training-mode preview is useful for qualitative monitoring, but it adds another student forward pass; keep it optional so distillation-only runs can stay in teacher passthrough for speed.
