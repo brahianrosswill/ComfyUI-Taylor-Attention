@@ -419,6 +419,8 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     )
     runtime.training_updates_done = 3
     runtime.steps_remaining = 7
+    runtime.layer_ready["single:11"] = True
+    runtime._record_training_metrics("single:11", {"loss": 0.5, "mse": 1.0, "nmse": 0.9, "cosine_similarity": 0.8, "ema_loss": 0.7})
     runtime._record_training_metrics("single:10", {"loss": 1.0, "mse": 2.0})
 
     assert start_calls == [("test-key", "proj", "ws")]
@@ -432,6 +434,14 @@ def test_record_training_metrics_logs_to_comet(monkeypatch):
     assert payload["flux2ttr/single:10/avg_mse"] == 2.0
     assert payload["flux2ttr/global/steps_remaining"] == 7.0
     assert payload["flux2ttr/global/updates_done"] == 3.0
+    assert payload["flux2ttr/global/layers_tracked"] == 2.0
+    assert payload["flux2ttr/global/layers_ready"] == 1.0
+    assert payload["flux2ttr/global/layers_ready_ratio"] == 0.5
+    assert payload["flux2ttr/global/loss_min"] == 0.5
+    assert payload["flux2ttr/global/loss_max"] == 1.0
+    assert payload["flux2ttr/global/loss_p50"] == 0.75
+    assert payload["flux2ttr/global/mse_min"] == 1.0
+    assert payload["flux2ttr/global/mse_max"] == 2.0
 
 
 def test_memory_reserve_estimate_scales_with_training():

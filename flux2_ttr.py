@@ -40,6 +40,7 @@ _DEFAULT_TEXT_TOKENS_GUESS = 77
 _DEFAULT_REPLAY_OFFLOAD_CPU = True
 _DEFAULT_REPLAY_STORAGE_DTYPE = "float16"
 _DEFAULT_REPLAY_MAX_BYTES = 768 * 1024 * 1024
+_COMET_AGG_METRICS = ("loss", "mse", "nmse", "cosine_similarity", "ema_loss")
 
 try:
     from comfy import model_management
@@ -675,6 +676,28 @@ class Flux2TTRRuntime:
         return (float(q[0].item()), float(q[1].item()))
 
     @staticmethod
+    def _quantile_summary(values: list[float]) -> dict[str, float]:
+        finite = [float(v) for v in values if math.isfinite(float(v))]
+        if not finite:
+            nan = float("nan")
+            return {
+                "min": nan,
+                "p25": nan,
+                "p50": nan,
+                "p75": nan,
+                "max": nan,
+            }
+        t = torch.tensor(finite, dtype=torch.float32)
+        q = torch.quantile(t, torch.tensor([0.25, 0.5, 0.75], dtype=torch.float32))
+        return {
+            "min": float(t.min().item()),
+            "p25": float(q[0].item()),
+            "p50": float(q[1].item()),
+            "p75": float(q[2].item()),
+            "max": float(t.max().item()),
+        }
+
+    @staticmethod
     def _format_layer_list(layer_keys: list[str], limit: int = 12) -> str:
         if not layer_keys:
             return "-"
@@ -970,6 +993,19 @@ class Flux2TTRRuntime:
             payload[f"flux2ttr/{layer_key}/avg_{key}"] = float(value)
         payload["flux2ttr/global/steps_remaining"] = float(self.steps_remaining)
         payload["flux2ttr/global/updates_done"] = float(self.training_updates_done)
+
+        # Cross-layer aggregate distributions (latest values per layer).
+        tracked_layers = list(self._layer_metric_latest.keys())
+        if tracked_layers:
+            ready_count = sum(1 for lk in tracked_layers if bool(self.layer_ready.get(lk, False)))
+            payload["flux2ttr/global/layers_tracked"] = float(len(tracked_layers))
+            payload["flux2ttr/global/layers_ready"] = float(ready_count)
+            payload["flux2ttr/global/layers_ready_ratio"] = float(ready_count / max(1, len(tracked_layers)))
+            for metric_name in _COMET_AGG_METRICS:
+                values = [self._layer_metric_latest[lk].get(metric_name, float("nan")) for lk in tracked_layers]
+                summary = self._quantile_summary(values)
+                for stat_name, stat_value in summary.items():
+                    payload[f"flux2ttr/global/{metric_name}_{stat_name}"] = float(stat_value)
         try:
             experiment.log_metrics(payload, step=int(self.training_updates_done))
         except Exception as exc:
