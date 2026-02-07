@@ -153,6 +153,18 @@ def test_runtime_resolve_inference_dtype_cpu_is_fp32():
     assert runtime._resolve_inference_dtype(x) == torch.float32
 
 
+def test_effective_scan_chunk_training_cap():
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+        scan_chunk_size=512,
+    )
+    assert runtime._effective_scan_chunk(training=False) == 512
+    assert runtime._effective_scan_chunk(training=True) == 64
+
+
 def test_memory_reserve_estimate_scales_with_training():
     infer_bytes = flux2_ttr._estimate_flux2_ttr_memory_bytes(
         batch=1,

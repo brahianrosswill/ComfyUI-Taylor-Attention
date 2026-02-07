@@ -17,6 +17,8 @@ _ORIGINAL_FLUX_ATTENTION: Dict[str, Any] = {}
 _PATCH_DEPTH = 0
 _RUNTIME_REGISTRY: Dict[str, "Flux2TTRRuntime"] = {}
 _MEMORY_RESERVE_FACTOR = 1.1
+_TRAINING_SCAN_CHUNK_CAP = 64
+_EMPIRICAL_TRAINING_FLOOR_BYTES = 3 * 1024 * 1024 * 1024
 
 try:
     from comfy import model_management
@@ -58,7 +60,7 @@ class TTRCell(nn.Module):
         output = torch.einsum("bf,bfv->bv", q, w_new)
         return output, w_new
 
-    def scan(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int = 128) -> torch.Tensor:
+    def _scan_impl(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int) -> torch.Tensor:
         batch_heads, seq_len, _ = q.shape
         if seq_len == 0:
             return v.new_zeros((batch_heads, 0, self.value_dim))
@@ -82,6 +84,21 @@ class TTRCell(nn.Module):
             w_state = w_prefix[:, -1, :, :]
         return torch.cat(output_chunks, dim=1)
 
+    def scan(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int = 128) -> torch.Tensor:
+        chunk = max(1, int(chunk_size))
+        while True:
+            try:
+                return self._scan_impl(q, k, v, chunk)
+            except torch.OutOfMemoryError:
+                if q.device.type != "cuda" or chunk <= 1:
+                    raise
+                next_chunk = max(1, chunk // 2)
+                if next_chunk == chunk:
+                    raise
+                logger.warning("Flux2TTR scan OOM at chunk_size=%d; retrying with chunk_size=%d", chunk, next_chunk)
+                chunk = next_chunk
+                torch.cuda.empty_cache()
+
 
 class TTRFluxLayer(nn.Module):
     def __init__(self, head_dim: int, feature_dim: int = 256, scan_chunk_tokens: int = 128):
@@ -96,7 +113,7 @@ class TTRFluxLayer(nn.Module):
         )
         self.regressor = TTRCell(self.feature_dim, self.head_dim)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: Optional[int] = None) -> torch.Tensor:
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("TTRFluxLayer expects q/k/v with shape [B, H, N, D].")
         if q.shape != k.shape or q.shape != v.shape:
@@ -109,16 +126,23 @@ class TTRFluxLayer(nn.Module):
         k_flat = rearrange(k, "b h n d -> (b h) n d")
         v_flat = rearrange(v, "b h n d -> (b h) n d")
 
-        # One shared pass through phi_net reduces kernel launch overhead.
-        qk_phi = self.phi_net(torch.cat([q_flat, k_flat], dim=0))
-        q_phi, k_phi = torch.split(qk_phi, q_flat.shape[0], dim=0)
+        # Training path keeps q/k projections separate to reduce peak activation memory.
+        if self.training:
+            q_phi = self.phi_net(q_flat)
+            k_phi = self.phi_net(k_flat)
+        else:
+            # One shared pass through phi_net reduces kernel launch overhead.
+            qk_phi = self.phi_net(torch.cat([q_flat, k_flat], dim=0))
+            q_phi, k_phi = torch.split(qk_phi, q_flat.shape[0], dim=0)
 
-        out_fwd = self.regressor.scan(q_phi, k_phi, v_flat, chunk_size=self.scan_chunk_tokens)
+        effective_chunk = self.scan_chunk_tokens if chunk_size is None else max(1, int(chunk_size))
+
+        out_fwd = self.regressor.scan(q_phi, k_phi, v_flat, chunk_size=effective_chunk)
         out_rev = self.regressor.scan(
             torch.flip(q_phi, dims=(1,)),
             torch.flip(k_phi, dims=(1,)),
             torch.flip(v_flat, dims=(1,)),
-            chunk_size=self.scan_chunk_tokens,
+            chunk_size=effective_chunk,
         )
         out_rev = torch.flip(out_rev, dims=(1,))
 
@@ -272,16 +296,21 @@ def _maybe_reserve_memory(
 
     batch, heads, seq_len, head_dim = q.shape
     dtype_size = torch.tensor([], dtype=dtype_accum).element_size()
+    effective_chunk = runtime._effective_scan_chunk(training)
     mem_bytes = _estimate_flux2_ttr_memory_bytes(
         batch=batch,
         heads=heads,
         seq_len=seq_len,
         head_dim=head_dim,
         feature_dim=runtime.feature_dim,
-        chunk_size=runtime.scan_chunk_size,
+        chunk_size=effective_chunk,
         dtype_size=dtype_size,
         training=training,
     )
+    if training:
+        # Empirical floor: feature_dim=256 typically needs around 3GB during online distillation.
+        scale = (runtime.feature_dim / 256.0) * (head_dim / 128.0) * max(1.0, (batch * heads) / 24.0)
+        mem_bytes = max(mem_bytes, int(_EMPIRICAL_TRAINING_FLOOR_BYTES * scale))
     mem_bytes = int(mem_bytes * _MEMORY_RESERVE_FACTOR)
     if mem_bytes <= 0:
         return
@@ -294,7 +323,7 @@ def _maybe_reserve_memory(
             seq_len,
             head_dim,
             runtime.feature_dim,
-            runtime.scan_chunk_size,
+            effective_chunk,
             dtype_size,
             _MEMORY_RESERVE_FACTOR,
         )
@@ -304,7 +333,12 @@ def _maybe_reserve_memory(
 
     try:
         model_management.free_memory(mem_bytes, q.device)
-        logger.info("Flux2TTR reserved ~%.2f MB for %s", mem_bytes / (1024 * 1024), "training" if training else "inference")
+        logger.info(
+            "Flux2TTR reserved ~%.2f MB for %s (chunk=%d)",
+            mem_bytes / (1024 * 1024),
+            "training" if training else "inference",
+            effective_chunk,
+        )
     except Exception as exc:
         logger.warning("Flux2TTR reserve memory failed: %s", exc)
 
@@ -353,6 +387,7 @@ class Flux2TTRRuntime:
         self.training_enabled = bool(training)
         self.steps_remaining = max(0, int(steps))
         self.scan_chunk_size = max(1, int(scan_chunk_size))
+        self.training_scan_chunk_size = max(1, min(self.scan_chunk_size, _TRAINING_SCAN_CHUNK_CAP))
         self.layer_start = int(layer_start)
         self.layer_end = int(layer_end)
         self.inference_mixed_precision = bool(inference_mixed_precision)
@@ -425,6 +460,11 @@ class Flux2TTRRuntime:
         if q.device.type == "cuda" and q.dtype in (torch.float16, torch.bfloat16):
             return q.dtype
         return torch.float32
+
+    def _effective_scan_chunk(self, training: bool) -> int:
+        if training:
+            return int(self.training_scan_chunk_size)
+        return int(self.scan_chunk_size)
 
     def _is_single_block_selected(self, transformer_options: Optional[dict]) -> bool:
         if transformer_options is None:
@@ -534,7 +574,7 @@ class Flux2TTRRuntime:
                         q_in = q_eff.float().clone()
                         k_in = k_eff.float().clone()
                         v_in = v.float().clone()
-                        student = layer(q_in, k_in, v_in)
+                        student = layer(q_in, k_in, v_in, chunk_size=self._effective_scan_chunk(training=True))
                         teacher = (
                             teacher_out.view(q.shape[0], q.shape[2], q.shape[1], q.shape[3])
                             .permute(0, 2, 1, 3)
@@ -562,7 +602,7 @@ class Flux2TTRRuntime:
         k_in = k_eff.to(dtype=inference_dtype)
         v_in = v.to(dtype=inference_dtype)
         with torch.no_grad():
-            student = layer(q_in, k_in, v_in)
+            student = layer(q_in, k_in, v_in, chunk_size=self._effective_scan_chunk(training=False))
         student_out = _flatten_heads(student).to(dtype=v.dtype)
         return student_out
 
@@ -683,6 +723,7 @@ class Flux2TTRRuntime:
             "training_mode": self.training_mode,
             "last_loss": self.last_loss,
             "scan_chunk_size": self.scan_chunk_size,
+            "training_scan_chunk_size": self.training_scan_chunk_size,
             "layer_start": self.layer_start,
             "layer_end": self.layer_end,
             "inference_mixed_precision": self.inference_mixed_precision,
@@ -718,6 +759,13 @@ class Flux2TTRRuntime:
         self.training_mode = bool(payload.get("training_mode", self.training_mode))
         self.last_loss = float(payload.get("last_loss", self.last_loss))
         self.scan_chunk_size = max(1, int(payload.get("scan_chunk_size", self.scan_chunk_size)))
+        self.training_scan_chunk_size = max(
+            1,
+            min(
+                self.scan_chunk_size,
+                int(payload.get("training_scan_chunk_size", self.training_scan_chunk_size)),
+            ),
+        )
         self.layer_start = int(payload.get("layer_start", self.layer_start))
         self.layer_end = int(payload.get("layer_end", self.layer_end))
         self.inference_mixed_precision = bool(payload.get("inference_mixed_precision", self.inference_mixed_precision))

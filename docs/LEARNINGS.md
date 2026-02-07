@@ -49,3 +49,4 @@
 - Flux2TTR quality collapsed when trained on synthetic calibration tensors; distillation must use native Flux attention outputs from real attention calls as teacher targets during sampling.
 - PyTorch blocks autograd when `nn.Linear` receives inference-mode tensors; for ComfyUI online distillation we must clone q/k/v (and teacher targets) inside `torch.inference_mode(False)` before backward.
 - Flux2TTR now performs Taylor-style VRAM reservation (`model_management.free_memory`) before training/inference attention calls, reserving `1.1x` of estimated working memory so ComfyUI can offload earlier node allocations.
+- Flux2TTR training is much more memory-sensitive than inference; capping training chunk size (64) and retrying scan chunks on OOM prevents giant `kv_assoc.cumsum` allocations from immediately exhausting VRAM.

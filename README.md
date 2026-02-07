@@ -156,10 +156,12 @@ Speed tips:
 - Distill once, then run with `training=false` for normal sampling.
 - Keep `feature_dim=256` unless quality demands a higher value.
 - Start `scan_chunk_size` around `128`; raise it for speed if VRAM allows, lower it if memory spikes.
+- For `training=true`, Flux2TTR now caps the effective scan chunk size to `64` by default to avoid large fp32 training spikes.
 - Use `layer_start` / `layer_end` to patch only late single blocks as a cheap quality/speed tradeoff.
 - Keep `inference_mixed_precision=true` on CUDA for the fastest inference path.
 - Flux2TTR now asks ComfyUI to reserve VRAM ahead of each TTR call (Taylor-style `free_memory` reservation) using a `1.1x` safety factor over estimated need.
 - Training at `feature_dim=256` typically needs roughly a few GB of extra VRAM; reservation is intended to offload earlier nodes before TTR allocates.
+- If a scan chunk still OOMs, Flux2TTR automatically retries with smaller chunk sizes (`512 -> 256 -> 128 -> ...`) until it fits.
 
 ## Clocked Sweep Values
 
