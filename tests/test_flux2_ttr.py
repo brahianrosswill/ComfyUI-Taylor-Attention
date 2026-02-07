@@ -246,6 +246,27 @@ def test_training_oom_disables_training_and_returns_teacher():
     assert runtime.training_enabled is False
 
 
+def test_high_loss_inference_falls_back_to_teacher():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime.training_mode = False
+    runtime.last_loss = 10.0
+    runtime.max_safe_inference_loss = 0.5
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+    opts = {"block_type": "single", "block_index": 0}
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, mask, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg)
+
+    baseline = fallback(q, k, v, None)
+    out = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    assert torch.allclose(out, baseline)
+
+
 def test_runtime_checkpoint_round_trip(tmp_path):
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=4)

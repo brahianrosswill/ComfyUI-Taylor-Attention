@@ -20,6 +20,7 @@ _MEMORY_RESERVE_FACTOR = 1.1
 _TRAINING_SCAN_CHUNK_CAP = 64
 _EMPIRICAL_TRAINING_FLOOR_BYTES = 3 * 1024 * 1024 * 1024
 _TRAINING_TOKEN_CAP = 128
+_MAX_SAFE_INFERENCE_LOSS = 0.5
 
 try:
     from comfy import model_management
@@ -48,6 +49,7 @@ class TTRCell(nn.Module):
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.value_dim = int(value_dim)
+        self.last_used_chunk = 1
 
     def forward_chunk(
         self,
@@ -83,6 +85,7 @@ class TTRCell(nn.Module):
             out_chunk = out_chunk * inv_counts[:, start:end, :].reciprocal()
             output_chunks.append(out_chunk)
             w_state = w_prefix[:, -1, :, :]
+        self.last_used_chunk = int(chunk)
         return torch.cat(output_chunks, dim=1)
 
     def scan(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int = 128) -> torch.Tensor:
@@ -107,6 +110,7 @@ class TTRFluxLayer(nn.Module):
         self.head_dim = int(head_dim)
         self.feature_dim = validate_feature_dim(feature_dim)
         self.scan_chunk_tokens = max(1, int(scan_chunk_tokens))
+        self.last_used_scan_chunk = self.scan_chunk_tokens
         self.phi_net = nn.Sequential(
             nn.Linear(self.head_dim, self.feature_dim),
             nn.SiLU(),
@@ -139,6 +143,7 @@ class TTRFluxLayer(nn.Module):
         effective_chunk = self.scan_chunk_tokens if chunk_size is None else max(1, int(chunk_size))
 
         out_fwd = self.regressor.scan(q_phi, k_phi, v_flat, chunk_size=effective_chunk)
+        used_fwd = int(getattr(self.regressor, "last_used_chunk", effective_chunk))
         out_rev = self.regressor.scan(
             torch.flip(q_phi, dims=(1,)),
             torch.flip(k_phi, dims=(1,)),
@@ -146,6 +151,8 @@ class TTRFluxLayer(nn.Module):
             chunk_size=effective_chunk,
         )
         out_rev = torch.flip(out_rev, dims=(1,))
+        used_rev = int(getattr(self.regressor, "last_used_chunk", effective_chunk))
+        self.last_used_scan_chunk = max(1, min(used_fwd, used_rev))
 
         out = out_fwd + out_rev
         return rearrange(out, "(b h) n d -> b h n d", b=batch, h=heads)
@@ -289,6 +296,7 @@ def _maybe_reserve_memory(
     transformer_options: Optional[dict],
     training: bool,
     dtype_accum: torch.dtype,
+    layer_key: Optional[str] = None,
 ) -> None:
     if model_management is None:
         return
@@ -299,7 +307,7 @@ def _maybe_reserve_memory(
     if training:
         seq_len = min(seq_len, max(1, int(runtime.training_token_cap)))
     dtype_size = torch.tensor([], dtype=dtype_accum).element_size()
-    effective_chunk = runtime._effective_scan_chunk(training)
+    effective_chunk = runtime._effective_scan_chunk(training, layer_key=layer_key)
     mem_bytes = _estimate_flux2_ttr_memory_bytes(
         batch=batch,
         heads=heads,
@@ -395,12 +403,16 @@ class Flux2TTRRuntime:
         self.layer_start = int(layer_start)
         self.layer_end = int(layer_end)
         self.inference_mixed_precision = bool(inference_mixed_precision)
+        self.max_safe_inference_loss = float(_MAX_SAFE_INFERENCE_LOSS)
         self.last_loss = float("nan")
         self.layers: Dict[str, TTRFluxLayer] = {}
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         self.pending_state: Dict[str, Dict[str, torch.Tensor]] = {}
         self.layer_specs: Dict[str, FluxLayerSpec] = {}
         self._projection_cache: Dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._scan_chunk_override_train: Dict[str, int] = {}
+        self._scan_chunk_override_infer: Dict[str, int] = {}
+        self._warned_high_loss = False
 
     def register_layer_specs(self, specs: Iterable[FluxLayerSpec]) -> None:
         for spec in specs:
@@ -465,10 +477,28 @@ class Flux2TTRRuntime:
             return q.dtype
         return torch.float32
 
-    def _effective_scan_chunk(self, training: bool) -> int:
-        if training:
-            return int(self.training_scan_chunk_size)
-        return int(self.scan_chunk_size)
+    def _effective_scan_chunk(self, training: bool, layer_key: Optional[str] = None) -> int:
+        base = int(self.training_scan_chunk_size) if training else int(self.scan_chunk_size)
+        if not layer_key:
+            return base
+        override_map = self._scan_chunk_override_train if training else self._scan_chunk_override_infer
+        override = override_map.get(layer_key)
+        if override is None:
+            return base
+        return max(1, min(base, int(override)))
+
+    def _update_scan_chunk_override(self, layer_key: str, training: bool, used_chunk: int) -> None:
+        used = max(1, int(used_chunk))
+        override_map = self._scan_chunk_override_train if training else self._scan_chunk_override_infer
+        prev = override_map.get(layer_key)
+        if prev is None or used < prev:
+            override_map[layer_key] = used
+            logger.info(
+                "Flux2TTR: adaptive scan chunk for %s (%s) -> %d",
+                layer_key,
+                "training" if training else "inference",
+                used,
+            )
 
     def _select_training_token_indices(self, seq_len: int, device: torch.device) -> Optional[torch.Tensor]:
         cap = max(0, int(self.training_token_cap))
@@ -577,7 +607,14 @@ class Flux2TTRRuntime:
             with torch.no_grad():
                 teacher_out = self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
             if self.training_enabled and self.steps_remaining > 0:
-                _maybe_reserve_memory(self, q_eff, transformer_options, training=True, dtype_accum=torch.float32)
+                _maybe_reserve_memory(
+                    self,
+                    q_eff,
+                    transformer_options,
+                    training=True,
+                    dtype_accum=torch.float32,
+                    layer_key=layer_key,
+                )
                 try:
                     with torch.inference_mode(False):
                         with torch.enable_grad():
@@ -602,7 +639,17 @@ class Flux2TTRRuntime:
                                 v_in = v_in[:, :, idx, :]
                                 teacher = teacher[:, :, idx, :]
 
-                            student = layer(q_in, k_in, v_in, chunk_size=self._effective_scan_chunk(training=True))
+                            student = layer(
+                                q_in,
+                                k_in,
+                                v_in,
+                                chunk_size=self._effective_scan_chunk(training=True, layer_key=layer_key),
+                            )
+                            self._update_scan_chunk_override(
+                                layer_key,
+                                training=True,
+                                used_chunk=getattr(layer, "last_used_scan_chunk", self._effective_scan_chunk(True, layer_key)),
+                            )
                             loss = torch.nn.functional.mse_loss(student, teacher)
                             optimizer = self.optimizers[layer_key]
                             optimizer.zero_grad(set_to_none=True)
@@ -620,16 +667,47 @@ class Flux2TTRRuntime:
                         torch.cuda.empty_cache()
             return teacher_out
 
+        if (
+            math.isfinite(self.last_loss)
+            and self.max_safe_inference_loss > 0
+            and self.last_loss > self.max_safe_inference_loss
+        ):
+            if not self._warned_high_loss:
+                logger.warning(
+                    "Flux2TTR: checkpoint loss %.6g exceeds safe inference threshold %.6g; using native attention fallback.",
+                    self.last_loss,
+                    self.max_safe_inference_loss,
+                )
+                self._warned_high_loss = True
+            return self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
+
         layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
         layer.eval()
         inference_dtype = self._resolve_inference_dtype(q_eff)
-        _maybe_reserve_memory(self, q_eff, transformer_options, training=False, dtype_accum=inference_dtype)
+        _maybe_reserve_memory(
+            self,
+            q_eff,
+            transformer_options,
+            training=False,
+            dtype_accum=inference_dtype,
+            layer_key=layer_key,
+        )
         self._set_layer_dtype(layer_key, layer, inference_dtype)
         q_in = q_eff.to(dtype=inference_dtype)
         k_in = k_eff.to(dtype=inference_dtype)
         v_in = v.to(dtype=inference_dtype)
         with torch.no_grad():
-            student = layer(q_in, k_in, v_in, chunk_size=self._effective_scan_chunk(training=False))
+            student = layer(
+                q_in,
+                k_in,
+                v_in,
+                chunk_size=self._effective_scan_chunk(training=False, layer_key=layer_key),
+            )
+        self._update_scan_chunk_override(
+            layer_key,
+            training=False,
+            used_chunk=getattr(layer, "last_used_scan_chunk", self._effective_scan_chunk(False, layer_key)),
+        )
         student_out = _flatten_heads(student).to(dtype=v.dtype)
         return student_out
 
@@ -752,6 +830,7 @@ class Flux2TTRRuntime:
             "scan_chunk_size": self.scan_chunk_size,
             "training_scan_chunk_size": self.training_scan_chunk_size,
             "training_token_cap": self.training_token_cap,
+            "max_safe_inference_loss": self.max_safe_inference_loss,
             "layer_start": self.layer_start,
             "layer_end": self.layer_end,
             "inference_mixed_precision": self.inference_mixed_precision,
@@ -795,6 +874,7 @@ class Flux2TTRRuntime:
             ),
         )
         self.training_token_cap = max(1, int(payload.get("training_token_cap", self.training_token_cap)))
+        self.max_safe_inference_loss = float(payload.get("max_safe_inference_loss", self.max_safe_inference_loss))
         self.layer_start = int(payload.get("layer_start", self.layer_start))
         self.layer_end = int(payload.get("layer_end", self.layer_end))
         self.inference_mixed_precision = bool(payload.get("inference_mixed_precision", self.inference_mixed_precision))

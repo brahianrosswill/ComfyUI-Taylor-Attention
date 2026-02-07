@@ -163,7 +163,9 @@ Speed tips:
 - Flux2TTR now asks ComfyUI to reserve VRAM ahead of each TTR call (Taylor-style `free_memory` reservation) using a `1.1x` safety factor over estimated need.
 - Training at `feature_dim=256` typically needs roughly a few GB of extra VRAM; reservation is intended to offload earlier nodes before TTR allocates.
 - If a scan chunk still OOMs, Flux2TTR automatically retries with smaller chunk sizes (`512 -> 256 -> 128 -> ...`) until it fits.
+- Flux2TTR now remembers smaller per-layer chunk sizes after OOM retries so it does not repeat the same failing chunk each call.
 - If training still OOMs, Flux2TTR disables training for the run and continues in teacher passthrough mode instead of crashing generation.
+- If checkpoint loss is still high, Flux2TTR will fail closed to native attention fallback in inference mode instead of emitting low-quality garbage output.
 
 ## Clocked Sweep Values
 

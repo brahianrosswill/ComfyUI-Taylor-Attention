@@ -51,3 +51,4 @@
 - Flux2TTR now performs Taylor-style VRAM reservation (`model_management.free_memory`) before training/inference attention calls, reserving `1.1x` of estimated working memory so ComfyUI can offload earlier node allocations.
 - Flux2TTR training is much more memory-sensitive than inference; capping training chunk size (64) and retrying scan chunks on OOM prevents giant `kv_assoc.cumsum` allocations from immediately exhausting VRAM.
 - For practical Flux VRAM limits, online distillation must use bounded token sampling and graceful OOM fallback (disable training but keep teacher passthrough) to avoid aborting the whole sampler run.
+- Adaptive scan chunking should be sticky per layer after an OOM retry; otherwise each attention call re-attempts known-failing chunk sizes and wastes time.
