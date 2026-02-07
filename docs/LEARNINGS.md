@@ -43,3 +43,4 @@
 - ClockedSweepValues accepts a single integer string to generate a 1..N clock and can infer clock length from values if left blank.
 - Added Combinations node to generate repeated value lists covering all combinations across inputs.
 - ClockedSweepValues and Combinations outputs are marked as float list outputs so downstream nodes receive expanded list values.
+- Flux2TTR patches Flux attention via pre-run/cleanup callbacks and resolves per-layer TTR modules using `transformer_options["block_type"]` and `block_index`, so single-block replacements can stay layer-specific without editing ComfyUI core.

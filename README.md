@@ -128,6 +128,26 @@ The `HybridTaylorAttentionBackend` node patches Flux's attention function at run
 - Quality stats logs include the hybrid config parameters used for the run.
 - When `log_quality_stats` is enabled, the results are also appended to `output/hybrid-attention-results.jsonl` with config + meta (sigma, shapes, inferred latent resolution, etc.).
 
+## Flux2TTR (Distilled TTR Attention)
+
+The `Flux2TTR` node adds a train/load workflow for replacing Flux single-block attention with bidirectional TTR layers.
+
+- Inputs:
+  - `model` (`MODEL`)
+  - `latents` (`LATENT`) and `conditioning` (`CONDITIONING`) for calibration data
+  - `learning_rate`, `steps`
+  - `training` toggle
+  - `checkpoint_path`
+  - `feature_dim` (must be a multiple of 256 and at least 128)
+- Outputs:
+  - patched `MODEL` with Flux attention routed through TTR modules
+  - `loss_value` from calibration/load state
+
+Behavior:
+- `training=true`: runs an in-node distillation calibration loop (teacher = softmax attention) and optionally saves a checkpoint.
+- `training=false`: loads TTR weights from `checkpoint_path` and enables inference with TTR attention.
+- During model execution, Flux attention is patched on pre-run and restored on cleanup; single-block calls route to per-layer `TTRFluxLayer` instances keyed by `block_index`.
+
 ## Clocked Sweep Values
 
 The `ClockedSweepValues` node maps a clock list to evenly distributed sweep values. Provide a clock list (any list of floats; length defines output length) and a list of values to sweep. The output is a float list (ComfyUI list output) the same length as the clock, split into equal contiguous segments per value. You can also enter a single integer string (e.g., `30`) to create a 1..N clock, or leave the clock blank to infer length from the values list.

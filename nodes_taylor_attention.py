@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 from typing import Dict, Any
 
 from typing_extensions import override
@@ -9,6 +11,7 @@ import comfy.patcher_extension as patcher_extension
 
 import taylor_attention
 import hybrid_attention
+import flux2_ttr
 import sweep_utils
 
 logger = logging.getLogger(__name__)
@@ -487,6 +490,129 @@ class HybridTaylorAttentionBackend(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+class Flux2TTR(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Flux2TTR",
+            display_name="Flux2TTR",
+            category="advanced/attention",
+            description="Replace Flux single-block attention with distilled bidirectional TTR layers.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Latent.Input("latents"),
+                io.Conditioning.Input("conditioning"),
+                io.Float.Input("learning_rate", default=1e-4, min=1e-7, max=1.0, step=1e-7),
+                io.Int.Input("steps", default=32, min=0, max=200000, step=1),
+                io.Boolean.Input("training", default=True, tooltip="Train TTR layers by distillation when enabled."),
+                io.String.Input(
+                    "checkpoint_path",
+                    default="",
+                    multiline=False,
+                    tooltip="Checkpoint file to load/save TTR layer weights.",
+                ),
+                io.Int.Input(
+                    "feature_dim",
+                    default=256,
+                    min=128,
+                    max=8192,
+                    step=256,
+                    tooltip="TTR feature dimension (must be a multiple of 256).",
+                ),
+            ],
+            outputs=[io.Model.Output(), io.Float.Output("loss_value")],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        latents,
+        conditioning,
+        learning_rate: float,
+        steps: int,
+        training: bool,
+        checkpoint_path: str,
+        feature_dim: int,
+    ) -> io.NodeOutput:
+        feature_dim = flux2_ttr.validate_feature_dim(feature_dim)
+        checkpoint_path = (checkpoint_path or "").strip()
+        train_steps = int(steps)
+
+        m = model.clone()
+        transformer_options = m.model_options.setdefault("transformer_options", {})
+
+        prev_cfg = transformer_options.get("flux2_ttr")
+        if isinstance(prev_cfg, dict):
+            prev_runtime = prev_cfg.get("runtime_id")
+            if isinstance(prev_runtime, str):
+                flux2_ttr.unregister_runtime(prev_runtime)
+
+        runtime = flux2_ttr.Flux2TTRRuntime(
+            feature_dim=feature_dim,
+            learning_rate=float(learning_rate),
+            training=bool(training),
+            steps=train_steps,
+        )
+        runtime.register_layer_specs(flux2_ttr.infer_flux_single_layer_specs(m))
+
+        if training:
+            if checkpoint_path and os.path.isfile(checkpoint_path):
+                logger.info("Flux2TTR: loading existing checkpoint before calibration: %s", checkpoint_path)
+                runtime.load_checkpoint(checkpoint_path)
+            loss_value = runtime.calibrate_from_inputs(
+                model=m,
+                latents=latents,
+                conditioning=conditioning,
+                steps=train_steps,
+            )
+            if checkpoint_path:
+                runtime.save_checkpoint(checkpoint_path)
+        else:
+            if not checkpoint_path:
+                raise ValueError("Flux2TTR: checkpoint_path is required when training is disabled.")
+            if not os.path.isfile(checkpoint_path):
+                raise FileNotFoundError(f"Flux2TTR: checkpoint not found: {checkpoint_path}")
+            runtime.load_checkpoint(checkpoint_path)
+            runtime.training_enabled = False
+            runtime.steps_remaining = 0
+            loss_value = float(runtime.last_loss) if not math.isnan(runtime.last_loss) else 0.0
+
+        runtime_id = flux2_ttr.register_runtime(runtime)
+        transformer_options["flux2_ttr"] = {
+            "enabled": True,
+            "runtime_id": runtime_id,
+            "training": runtime.training_enabled,
+            "feature_dim": feature_dim,
+            "checkpoint_path": checkpoint_path,
+        }
+
+        callback_key = "flux2_ttr"
+        m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_PRE_RUN, callback_key)
+        m.remove_callbacks_with_key(patcher_extension.CallbacksMP.ON_CLEANUP, callback_key)
+        m.add_callback_with_key(
+            patcher_extension.CallbacksMP.ON_PRE_RUN,
+            callback_key,
+            flux2_ttr.pre_run_callback,
+        )
+        m.add_callback_with_key(
+            patcher_extension.CallbacksMP.ON_CLEANUP,
+            callback_key,
+            flux2_ttr.cleanup_callback,
+        )
+
+        logger.info(
+            "Flux2TTR configured: training=%s steps=%d feature_dim=%d checkpoint=%s loss=%.6g",
+            training,
+            train_steps,
+            feature_dim,
+            checkpoint_path if checkpoint_path else "<none>",
+            float(loss_value),
+        )
+        return io.NodeOutput(m, float(loss_value))
+
+
 class ClockedSweepValues(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -620,7 +746,7 @@ class Combinations(io.ComfyNode):
 class TaylorAttentionExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [TaylorAttentionBackend, HybridTaylorAttentionBackend, ClockedSweepValues, Combinations]
+        return [TaylorAttentionBackend, HybridTaylorAttentionBackend, Flux2TTR, ClockedSweepValues, Combinations]
 
 
 async def comfy_entrypoint() -> TaylorAttentionExtension:
