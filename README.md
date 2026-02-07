@@ -135,7 +135,7 @@ The `Flux2TTR` node adds a train/load workflow for replacing Flux single-block a
 - Inputs:
   - `model` (`MODEL`)
   - `latents` (`LATENT`) and `conditioning` (`CONDITIONING`) for calibration data
-  - `learning_rate`, `steps`
+  - `learning_rate`, `steps` (default `512`)
   - `training` toggle
   - `checkpoint_path`
   - `feature_dim` (must be a multiple of 256 and at least 128)

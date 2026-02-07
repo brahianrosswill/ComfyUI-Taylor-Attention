@@ -503,7 +503,7 @@ class Flux2TTR(io.ComfyNode):
                 io.Latent.Input("latents"),
                 io.Conditioning.Input("conditioning"),
                 io.Float.Input("learning_rate", default=1e-4, min=1e-7, max=1.0, step=1e-7),
-                io.Int.Input("steps", default=32, min=0, max=200000, step=1),
+                io.Int.Input("steps", default=512, min=0, max=200000, step=1),
                 io.Boolean.Input("training", default=True, tooltip="Train TTR layers by distillation when enabled."),
                 io.String.Input(
                     "checkpoint_path",
