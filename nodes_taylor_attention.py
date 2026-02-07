@@ -623,11 +623,15 @@ class Flux2TTR(io.ComfyNode):
             "runtime_id": runtime_id,
             "training": runtime.training_enabled,
             "training_mode": runtime.training_mode,
+            "training_steps_total": int(runtime.training_steps_total),
+            "training_steps_remaining": int(runtime.steps_remaining),
+            "learning_rate": float(learning_rate),
             "feature_dim": feature_dim,
             "scan_chunk_size": int(scan_chunk_size),
             "layer_start": int(layer_start),
             "layer_end": int(layer_end),
             "inference_mixed_precision": bool(inference_mixed_precision),
+            "max_safe_inference_loss": float(runtime.max_safe_inference_loss),
             "checkpoint_path": checkpoint_path,
         }
 

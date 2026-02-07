@@ -295,6 +295,41 @@ def test_cleanup_unregisters_runtime_and_releases_resources(monkeypatch):
     assert flux2_ttr.get_runtime(runtime_id) is None
 
 
+def test_recover_runtime_from_config_inference_requires_checkpoint():
+    cfg = {
+        "training_mode": False,
+        "feature_dim": 256,
+        "scan_chunk_size": 128,
+        "layer_start": 10,
+        "layer_end": 19,
+        "inference_mixed_precision": True,
+        "checkpoint_path": "",
+    }
+    runtime = flux2_ttr._recover_runtime_from_config(cfg)
+    assert runtime is None
+
+
+def test_recover_runtime_from_config_training_without_checkpoint():
+    cfg = {
+        "training_mode": True,
+        "training": True,
+        "training_steps_total": 64,
+        "training_steps_remaining": 32,
+        "learning_rate": 1e-4,
+        "feature_dim": 256,
+        "scan_chunk_size": 128,
+        "layer_start": 10,
+        "layer_end": 19,
+        "inference_mixed_precision": True,
+        "checkpoint_path": "",
+    }
+    runtime = flux2_ttr._recover_runtime_from_config(cfg)
+    assert runtime is not None
+    assert runtime.training_mode is True
+    assert runtime.training_enabled is True
+    assert runtime.steps_remaining == 32
+
+
 def test_training_progress_logs_every_10_updates(caplog):
     torch.manual_seed(0)
     runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=True, steps=10)

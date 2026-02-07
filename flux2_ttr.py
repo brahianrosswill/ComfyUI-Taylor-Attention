@@ -697,6 +697,11 @@ class Flux2TTRRuntime:
                             layer_key,
                             self.steps_remaining,
                         )
+                    if isinstance(transformer_options, dict):
+                        cfg = transformer_options.get("flux2_ttr")
+                        if isinstance(cfg, dict):
+                            cfg["training_steps_remaining"] = int(self.steps_remaining)
+                            cfg["training_updates_done"] = int(self.training_updates_done)
                     if self.steps_remaining <= 0:
                         self.training_enabled = False
                         logger.info("Flux2TTR: online distillation reached configured steps; continuing teacher passthrough for this run.")
@@ -951,6 +956,53 @@ def unregister_runtime(runtime_id: str) -> None:
     _RUNTIME_REGISTRY.pop(runtime_id, None)
 
 
+def _recover_runtime_from_config(cfg: dict) -> Optional[Flux2TTRRuntime]:
+    if not isinstance(cfg, dict):
+        return None
+    feature_dim = int(cfg.get("feature_dim", 256))
+    scan_chunk_size = int(cfg.get("scan_chunk_size", 128))
+    layer_start = int(cfg.get("layer_start", -1))
+    layer_end = int(cfg.get("layer_end", -1))
+    inference_mixed_precision = bool(cfg.get("inference_mixed_precision", True))
+    training_mode = bool(cfg.get("training_mode", False))
+    training_total = max(0, int(cfg.get("training_steps_total", 0)))
+    training_remaining = max(0, int(cfg.get("training_steps_remaining", training_total)))
+    learning_rate = float(cfg.get("learning_rate", 1e-4))
+
+    runtime = Flux2TTRRuntime(
+        feature_dim=feature_dim,
+        learning_rate=learning_rate,
+        training=training_mode,
+        steps=training_total,
+        scan_chunk_size=scan_chunk_size,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        inference_mixed_precision=inference_mixed_precision,
+    )
+    runtime.training_mode = training_mode
+    runtime.training_steps_total = training_total
+    runtime.steps_remaining = training_remaining
+    runtime.training_enabled = bool(cfg.get("training", False)) and training_remaining > 0
+    runtime.max_safe_inference_loss = float(cfg.get("max_safe_inference_loss", runtime.max_safe_inference_loss))
+
+    checkpoint_path = (cfg.get("checkpoint_path") or "").strip()
+    if checkpoint_path and os.path.isfile(checkpoint_path):
+        runtime.load_checkpoint(checkpoint_path)
+    elif not training_mode:
+        logger.warning(
+            "Flux2TTR: cannot recover inference runtime without a valid checkpoint_path (got %r).",
+            checkpoint_path,
+        )
+        return None
+
+    if not training_mode:
+        runtime.training_enabled = False
+        runtime.steps_remaining = 0
+        runtime.training_updates_done = 0
+
+    return runtime
+
+
 def flux2_ttr_attention(q, k, v, pe, mask=None, transformer_options=None):
     cfg = transformer_options.get("flux2_ttr") if transformer_options else None
     original = _ORIGINAL_FLUX_ATTENTION.get("math")
@@ -962,8 +1014,14 @@ def flux2_ttr_attention(q, k, v, pe, mask=None, transformer_options=None):
     runtime_id = cfg.get("runtime_id")
     runtime = get_runtime(runtime_id)
     if runtime is None:
-        logger.warning("Flux2TTR: runtime_id=%s not found; falling back to original attention.", runtime_id)
-        return original(q, k, v, pe, mask=mask, transformer_options=transformer_options)
+        recovered = _recover_runtime_from_config(cfg)
+        if recovered is None:
+            logger.warning("Flux2TTR: runtime_id=%s not found and recovery failed; falling back to original attention.", runtime_id)
+            return original(q, k, v, pe, mask=mask, transformer_options=transformer_options)
+        if isinstance(runtime_id, str) and runtime_id:
+            _RUNTIME_REGISTRY[runtime_id] = recovered
+        runtime = recovered
+        logger.info("Flux2TTR: recovered runtime_id=%s from config/checkpoint.", runtime_id)
 
     return runtime.run_attention(
         q=q,
