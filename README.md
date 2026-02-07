@@ -147,6 +147,8 @@ Flux2TTR is now split into four nodes:
   - Runs dual-path sampling (`model_original` teacher vs `model_ttr` student).
   - Computes RMSE/cosine/LPIPS quality delta and updates controller with REINFORCE.
   - Uses fixed per-run `controller_mask_override` during patched sampling.
+  - Logs Comet metrics with `flux2ttr_controller/*` prefixes when `training_config.logging_config.comet_enabled=true`.
+  - Comet run parameters now include flattened training config + run config metadata (`steps`, `cfg`, sampler/scheduler, batch size, controller layers, etc.).
   - Outputs: `IMAGE_ORIGINAL`, `IMAGE_PATCHED`, and `TTR_CONTROLLER`.
 
 - `Flux2TTRController`: inference-time patch node.

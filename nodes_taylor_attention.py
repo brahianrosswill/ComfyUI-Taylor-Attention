@@ -1415,24 +1415,82 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         return 0.0
 
     @staticmethod
-    def _maybe_start_comet(logging_cfg: dict[str, Any], training_config: dict[str, dict[str, Any]]):
+    def _flatten_comet_params(prefix: str, payload: dict[str, Any], out: dict[str, Any]) -> None:
+        for key, value in payload.items():
+            full_key = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                Flux2TTRControllerTrainer._flatten_comet_params(full_key, value, out)
+            elif isinstance(value, (list, tuple)):
+                out[full_key] = ",".join(str(x) for x in value)
+            else:
+                out[full_key] = value
+
+    @staticmethod
+    def _sanitize_metric(value: Any) -> Optional[float]:
+        try:
+            v = float(value)
+            if math.isfinite(v):
+                return v
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _build_comet_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+        payload: dict[str, float] = {}
+        for key, value in metrics.items():
+            sanitized = Flux2TTRControllerTrainer._sanitize_metric(value)
+            if sanitized is None:
+                continue
+            payload[f"flux2ttr_controller/{key}"] = sanitized
+        return payload
+
+    @staticmethod
+    def _safe_comet_log_metrics(experiment, payload: dict[str, float], step: int) -> bool:
+        if experiment is None or not payload:
+            return False
+        try:
+            experiment.log_metrics(payload, step=int(step))
+            return True
+        except Exception as exc:
+            logger.warning("Flux2TTRControllerTrainer: failed to log Comet metrics at step %d (%s).", int(step), exc)
+            return False
+
+    @staticmethod
+    def _maybe_start_comet(
+        logging_cfg: dict[str, Any],
+        training_config: dict[str, dict[str, Any]],
+        run_config: dict[str, Any],
+    ):
         enabled = _bool_or(logging_cfg.get("comet_enabled"), False)
         if not enabled:
+            logger.info("Flux2TTRControllerTrainer: Comet logging disabled (training_config.logging_config.comet_enabled=false).")
             return None
         try:
             import comet_ml  # type: ignore
 
             api_key = _string_or(logging_cfg.get("comet_api_key"), "").strip() or os.getenv("COMET_API_KEY", "")
+            if not api_key:
+                logger.warning(
+                    "Flux2TTRControllerTrainer: Comet logging enabled but no API key found "
+                    "(set training_config.comet_api_key or COMET_API_KEY)."
+                )
+                return None
             project_name = _string_or(logging_cfg.get("comet_project_name"), "ttr-distillation")
             workspace = _string_or(logging_cfg.get("comet_workspace"), "").strip() or None
             experiment = comet_ml.start(api_key=api_key or None, project_name=project_name, workspace=workspace)
-            experiment.log_parameters(
-                {
-                    "flux2ttr_phase": "controller_train",
-                    "loss_config": dict(training_config.get("loss_config", {})),
-                    "optimizer_config": dict(training_config.get("optimizer_config", {})),
-                    "schedule_config": dict(training_config.get("schedule_config", {})),
-                }
+            params: dict[str, Any] = {
+                "flux2ttr_phase": "controller_train",
+                "project_name": project_name,
+                "workspace": workspace or "",
+            }
+            Flux2TTRControllerTrainer._flatten_comet_params("training_config", training_config, params)
+            Flux2TTRControllerTrainer._flatten_comet_params("run_config", run_config, params)
+            experiment.log_parameters(params)
+            logger.info(
+                "Flux2TTRControllerTrainer: Comet logging enabled (project=%s workspace=%s).",
+                project_name,
+                workspace or "<none>",
             )
             return experiment
         except Exception as exc:
@@ -1516,10 +1574,27 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         trainer = flux2_ttr_controller.ControllerTrainer(controller=controller, training_config=normalized_cfg, device=device)
         latent_items = cls._split_latent_batch(latent)
         sigma_value = cls._representative_sigma(model_ttr, scheduler=scheduler, steps=int(steps))
-        comet_experiment = cls._maybe_start_comet(logging_cfg, normalized_cfg)
-
         total_iterations = max(1, int(training_iterations))
         total_steps = total_iterations * max(1, len(latent_items))
+        comet_experiment = cls._maybe_start_comet(
+            logging_cfg,
+            normalized_cfg,
+            run_config={
+                "steps": int(steps),
+                "seed": int(seed),
+                "cfg": float(cfg),
+                "sampler_name": str(sampler_name),
+                "scheduler": str(scheduler),
+                "training_iterations": int(total_iterations),
+                "latent_batch_size": int(len(latent_items)),
+                "total_steps": int(total_steps),
+                "denoise": float(denoise),
+                "controller_num_layers": int(controller.num_layers),
+                "checkpoint_path": checkpoint_path,
+                "device": str(device),
+            },
+        )
+
         global_step = 0
         last_original_images: Optional[torch.Tensor] = None
         last_patched_images: Optional[torch.Tensor] = None
@@ -1616,18 +1691,30 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                         "lpips": float(quality_metrics["lpips"]),
                         "efficiency_penalty": float(reinforce_metrics["efficiency_penalty"]),
                         "mask_mean": float(actual_full_attn_ratio),
+                        "probs_mean": float(reinforce_metrics.get("probs_mean", actual_full_attn_ratio)),
+                        "reward": float(reinforce_metrics.get("reward", reward)),
+                        "baselined_reward": float(reinforce_metrics.get("baselined_reward", 0.0)),
                         "reward_baseline": float(reinforce_metrics["reward_baseline"]),
                         "policy_loss": float(reinforce_metrics["policy_loss"]),
                         "reinforce_total_loss": float(reinforce_metrics["total_loss"]),
+                        "actual_full_attn_ratio": float(reinforce_metrics.get("actual_full_attn_ratio", actual_full_attn_ratio)),
+                        "target_ttr_ratio": float(reinforce_metrics.get("target_ttr_ratio", 0.0)),
                         "gumbel_temperature": float(gumbel_temperature),
                         "sigma": float(sigma_value),
                         "iteration": float(iteration + 1),
                         "latent_index": float(latent_idx),
+                        "width": float(width),
+                        "height": float(height),
+                        "step": float(global_step + 1),
                     }
 
                     global_step += 1
                     if comet_experiment is not None and (global_step % log_every == 0 or global_step == total_steps):
-                        comet_experiment.log_metrics(metrics, step=global_step)
+                        cls._safe_comet_log_metrics(
+                            comet_experiment,
+                            cls._build_comet_metrics(metrics),
+                            global_step,
+                        )
 
                     if global_step % log_every == 0 or global_step == total_steps:
                         logger.info(
@@ -1663,6 +1750,20 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                     last_original_images = torch.cat(iter_original_images, dim=0)
                 if iter_patched_images:
                     last_patched_images = torch.cat(iter_patched_images, dim=0)
+
+            if comet_experiment is not None:
+                cls._safe_comet_log_metrics(
+                    comet_experiment,
+                    cls._build_comet_metrics(
+                        {
+                            "training_completed": 1.0,
+                            "total_steps": float(total_steps),
+                            "total_iterations": float(total_iterations),
+                            "final_reward_baseline": float(trainer._reward_baseline),
+                        }
+                    ),
+                    global_step if global_step > 0 else 0,
+                )
         finally:
             if comet_experiment is not None:
                 try:
