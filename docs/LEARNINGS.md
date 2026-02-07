@@ -47,3 +47,4 @@
 - ComfyUI node execution may run under `torch.inference_mode()`, so any in-node distillation/training must explicitly use `torch.inference_mode(False)` and `torch.enable_grad()` around backward passes.
 - Flux2TTR inference speed improved substantially by replacing per-token Python scan loops with chunked vectorized prefix updates (`cumsum` over `k⊗v`), and by running CUDA inference in input dtype (bf16/fp16) while keeping training in fp32.
 - Flux2TTR quality collapsed when trained on synthetic calibration tensors; distillation must use native Flux attention outputs from real attention calls as teacher targets during sampling.
+- PyTorch blocks autograd when `nn.Linear` receives inference-mode tensors; for ComfyUI online distillation we must clone q/k/v (and teacher targets) inside `torch.inference_mode(False)` before backward.

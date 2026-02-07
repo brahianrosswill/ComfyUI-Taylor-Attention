@@ -429,24 +429,27 @@ class Flux2TTRRuntime:
 
         spec = self.layer_specs.get(layer_key)
         head_dim = spec.head_dim if spec else int(q_eff.shape[-1])
-        layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
 
         if self.training_mode:
             with torch.no_grad():
                 teacher_out = self._teacher_from_fallback(fallback_attention, q, k, v, pe, mask, transformer_options)
             if self.training_enabled and self.steps_remaining > 0:
-                self._set_layer_dtype(layer_key, layer, torch.float32)
-                layer.train()
                 with torch.inference_mode(False):
                     with torch.enable_grad():
-                        q_in = q_eff.float()
-                        k_in = k_eff.float()
-                        v_in = v.float()
+                        layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
+                        self._set_layer_dtype(layer_key, layer, torch.float32)
+                        layer.train()
+                        # ComfyUI may call us under torch.inference_mode(); clone converts
+                        # inference tensors to normal tensors that autograd can save.
+                        q_in = q_eff.float().clone()
+                        k_in = k_eff.float().clone()
+                        v_in = v.float().clone()
                         student = layer(q_in, k_in, v_in)
                         teacher = (
                             teacher_out.view(q.shape[0], q.shape[2], q.shape[1], q.shape[3])
                             .permute(0, 2, 1, 3)
                             .float()
+                            .clone()
                         )
                         loss = torch.nn.functional.mse_loss(student, teacher)
                         optimizer = self.optimizers[layer_key]
@@ -460,6 +463,7 @@ class Flux2TTRRuntime:
                     logger.info("Flux2TTR: online distillation reached configured steps; continuing teacher passthrough for this run.")
             return teacher_out
 
+        layer = self._ensure_layer(layer_key, head_dim, q_eff.device)
         layer.eval()
         inference_dtype = self._resolve_inference_dtype(q_eff)
         self._set_layer_dtype(layer_key, layer, inference_dtype)
@@ -543,6 +547,9 @@ class Flux2TTRRuntime:
 
                     q_seq = q_seq / (torch.norm(q_seq, dim=-1, keepdim=True) + 1e-6)
                     k_seq = k_seq / (torch.norm(k_seq, dim=-1, keepdim=True) + 1e-6)
+                    q_seq = q_seq.float().clone()
+                    k_seq = k_seq.float().clone()
+                    v_seq = v_seq.float().clone()
 
                     layer = self._ensure_layer(layer_key, spec.head_dim, token_features.device)
                     layer.train()
