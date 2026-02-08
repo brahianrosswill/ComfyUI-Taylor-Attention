@@ -88,6 +88,52 @@ def test_controller_trainer_restore_training_state_is_backward_compatible():
     assert len(trainer.optimizer.state) == 0
 
 
+def test_controller_trainer_restore_training_state_clones_inference_tensors(tmp_path):
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, learning_rate=1e-2, target_ttr_ratio=0.5)
+    trainer.reinforce_step(
+        sigma=0.6,
+        cfg_scale=3.5,
+        width=64,
+        height=64,
+        sampled_mask=torch.tensor([1.0, 0.0, 1.0]),
+        reward=0.8,
+        actual_full_attn_ratio=2.0 / 3.0,
+    )
+
+    path = tmp_path / "controller_inference_restore.pt"
+    flux2_ttr_controller.save_controller_checkpoint(controller, str(path), trainer=trainer)
+
+    restored_controller = flux2_ttr_controller.load_controller_checkpoint(str(path))
+    restored_trainer = flux2_ttr_controller.ControllerTrainer(
+        restored_controller,
+        learning_rate=1e-2,
+        target_ttr_ratio=0.5,
+    )
+
+    with torch.inference_mode():
+        payload = flux2_ttr_controller.load_controller_training_state(str(path))
+        restored_trainer.restore_training_state(payload)
+
+    for state in restored_trainer.optimizer.state.values():
+        for value in state.values():
+            if torch.is_tensor(value):
+                assert not flux2_ttr_controller.ControllerTrainer._is_inference_tensor(value)
+
+    with torch.inference_mode():
+        metrics = restored_trainer.reinforce_step(
+            sigma=0.6,
+            cfg_scale=3.5,
+            width=64,
+            height=64,
+            sampled_mask=torch.tensor([1.0, 0.0, 1.0]),
+            reward=0.7,
+            actual_full_attn_ratio=2.0 / 3.0,
+        )
+    assert "total_loss" in metrics
+
+
 def test_controller_trainer_compute_loss_without_lpips():
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
     trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0)

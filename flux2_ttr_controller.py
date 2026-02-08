@@ -255,12 +255,15 @@ class ControllerTrainer:
             self._reward_count = int(payload["reward_count"])
         if "optimizer_state_dict" in payload and payload["optimizer_state_dict"] is not None:
             try:
-                self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+                with torch.inference_mode(False):
+                    optimizer_state = self._clone_state_tensors(payload["optimizer_state_dict"])
+                    self.optimizer.load_state_dict(optimizer_state)
                 target_device = self.controller._input_device_dtype()[0]
                 for state in self.optimizer.state.values():
                     for key, value in state.items():
                         if torch.is_tensor(value):
-                            state[key] = value.to(device=target_device)
+                            with torch.inference_mode(False):
+                                state[key] = value.detach().clone().to(device=target_device)
             except Exception as exc:
                 logger.warning(
                     "ControllerTrainer: failed to restore optimizer state (%s). "
@@ -288,6 +291,18 @@ class ControllerTrainer:
     @staticmethod
     def _clone_state_dict_tensors(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return {k: v.detach().clone() if torch.is_tensor(v) else v for k, v in state_dict.items()}
+
+    @classmethod
+    def _clone_state_tensors(cls, obj: Any) -> Any:
+        if torch.is_tensor(obj):
+            return obj.detach().clone()
+        if isinstance(obj, dict):
+            return {k: cls._clone_state_tensors(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [cls._clone_state_tensors(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(cls._clone_state_tensors(v) for v in obj)
+        return obj
 
     @classmethod
     def _rebuild_controller_trainable_copy(cls, controller: TTRController) -> TTRController:
