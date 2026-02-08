@@ -83,3 +83,4 @@
 - Prompt-list workflows are simpler with a dedicated JSON loader node that strictly validates `array<string>` input, instead of overloading text widgets for long prompt batches.
 - Controller training quality is more stable when mask sampling excludes non-ready Phase-1 TTR layers; forcing unready layers to full attention avoids training signal contamination from fallback-heavy student runs.
 - Controller efficiency penalties must compare full-attention usage against `1 - target_ttr_ratio`; treating `target_ttr_ratio` as a full-attention budget silently under-penalizes high full-attention masks.
+- LPIPS in controller training must ensure the LPIPS module and decoded RGB tensors are on the same device at call time; static init-time placement can drift and trigger CPU/CUDA mismatch errors.

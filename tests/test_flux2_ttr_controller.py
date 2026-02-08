@@ -63,6 +63,49 @@ def test_controller_trainer_efficiency_penalty_uses_ttr_target_semantics():
     assert metrics["efficiency_penalty"] == pytest.approx(0.6)
 
 
+def test_controller_trainer_lpips_device_sync_for_compute_loss():
+    class StrictDeviceLPIPS(torch.nn.Module):
+        def __init__(self, initial_device: torch.device):
+            super().__init__()
+            self.current_device = torch.device(initial_device)
+
+        def to(self, *args, **kwargs):
+            device = kwargs.get("device")
+            if device is None and args:
+                device = args[0]
+            if device is not None:
+                self.current_device = torch.device(device)
+            return self
+
+        def forward(self, in0: torch.Tensor, in1: torch.Tensor) -> torch.Tensor:
+            if in0.device != self.current_device or in1.device != self.current_device:
+                raise RuntimeError(
+                    f"StrictDeviceLPIPS mismatch: model on {self.current_device}, inputs on {in0.device}/{in1.device}"
+                )
+            return (in0 - in1).abs().mean().reshape(1, 1, 1, 1)
+
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0)
+    trainer.lpips_weight = 1.0
+    trainer.lpips_model = StrictDeviceLPIPS(torch.device("cuda:0"))
+
+    teacher = torch.zeros(1, 4, 4, 4)
+    student = torch.zeros_like(teacher)
+    teacher_rgb = torch.zeros(1, 3, 8, 8)
+    student_rgb = torch.ones(1, 3, 8, 8) * 0.25
+    loss, metrics = trainer.compute_loss(
+        teacher_latent=teacher,
+        student_latent=student,
+        actual_full_attn_ratio=0.0,
+        teacher_rgb=teacher_rgb,
+        student_rgb=student_rgb,
+    )
+
+    assert loss.item() >= 0.0
+    assert metrics["lpips"] > 0.0
+    assert trainer.lpips_model.current_device == teacher_rgb.device
+
+
 def test_controller_trainer_lpips_requires_dependency(monkeypatch):
     monkeypatch.setitem(sys.modules, "lpips", None)
     controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)

@@ -261,6 +261,25 @@ class ControllerTrainer:
         return x.clamp(-1.0, 1.0)
 
     @staticmethod
+    def _module_primary_device(module: nn.Module) -> Optional[torch.device]:
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            return tensor.device
+        return None
+
+    def _ensure_lpips_model_device(self, target_device: torch.device) -> None:
+        if self.lpips_model is None:
+            return
+        current_device = self._module_primary_device(self.lpips_model)
+        if current_device != target_device:
+            logger.debug(
+                "ControllerTrainer: moving LPIPS model from %s to %s.",
+                str(current_device),
+                str(target_device),
+            )
+            with torch.inference_mode(False):
+                self.lpips_model.to(device=target_device)
+
+    @staticmethod
     def _ratio_tensor(
         actual_full_attn_ratio: float | torch.Tensor,
         *,
@@ -304,9 +323,15 @@ class ControllerTrainer:
                 raise RuntimeError("LPIPS requested but lpips_model is not initialized.")
             if teacher_rgb is None or student_rgb is None:
                 raise ValueError("teacher_rgb and student_rgb are required when lpips_weight > 0.")
-            teacher_rgb = self._prep_lpips_rgb(teacher_rgb).to(device=loss.device)
-            student_rgb = self._prep_lpips_rgb(student_rgb).to(device=loss.device)
-            lpips_term = self.lpips_model(student_rgb, teacher_rgb).mean()
+            teacher_rgb = self._prep_lpips_rgb(teacher_rgb)
+            student_rgb = self._prep_lpips_rgb(student_rgb)
+
+            lpips_device = teacher_rgb.device
+            if student_rgb.device != lpips_device:
+                student_rgb = student_rgb.to(device=lpips_device)
+            self._ensure_lpips_model_device(lpips_device)
+
+            lpips_term = self.lpips_model(student_rgb, teacher_rgb).mean().to(device=loss.device)
             loss = loss + self.lpips_weight * lpips_term
 
         ratio = self._ratio_tensor(

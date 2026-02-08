@@ -146,6 +146,7 @@ Flux2TTR is now split into four nodes:
 - `Flux2TTRControllerTrainer`: Phase-2 controller training.
   - Runs dual-path sampling (`model_original` teacher vs `model_ttr` student).
   - Computes RMSE/cosine/LPIPS quality delta and updates controller with REINFORCE.
+  - LPIPS evaluation now auto-synchronizes module/input device placement per step to avoid CPU/CUDA mismatch errors.
   - Uses fixed per-run `controller_mask_override` during patched sampling.
   - Restricts TTR substitution to readiness-qualified layers from the Phase-1 checkpoint; non-ready layers are forced to full attention.
   - Logs Comet metrics with `flux2ttr_controller/*` prefixes when `training_config.logging_config.comet_enabled=true`.
