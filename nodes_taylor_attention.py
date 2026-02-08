@@ -1686,6 +1686,34 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         flux_cfg["controller_threshold"] = 0.5
 
         trainer = flux2_ttr_controller.ControllerTrainer(controller=controller, training_config=normalized_cfg, device=device)
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            try:
+                payload = flux2_ttr_controller.load_controller_training_state(checkpoint_path, map_location="cpu")
+                trainer.restore_training_state(payload)
+                has_optimizer_state = (
+                    "optimizer_state_dict" in payload and payload["optimizer_state_dict"] is not None
+                )
+                has_baseline_state = (
+                    ("reward_baseline" in payload and payload["reward_baseline"] is not None)
+                    or ("reward_count" in payload and payload["reward_count"] is not None)
+                )
+                if has_optimizer_state or has_baseline_state:
+                    logger.info(
+                        "Flux2TTR controller: restored training state "
+                        "(reward_baseline=%.4f, reward_count=%d, optimizer restored=%s)",
+                        trainer.reward_baseline,
+                        trainer.reward_count,
+                        has_optimizer_state,
+                    )
+                else:
+                    logger.info(
+                        "Flux2TTR controller: no persisted training state in checkpoint. Starting fresh optimizer/baseline."
+                    )
+            except Exception as exc:
+                logger.info(
+                    "Flux2TTR controller: no training state to restore (%s). Starting fresh.",
+                    exc,
+                )
         latent_items = cls._split_latent_batch(latent)
         sigma_value = cls._representative_sigma(model_ttr, scheduler=scheduler, steps=int(steps))
         total_iterations = max(1, int(training_iterations))
@@ -1887,7 +1915,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             checkpoint_every=checkpoint_every,
                         )
                     ):
-                        flux2_ttr_controller.save_controller_checkpoint(controller, checkpoint_path)
+                        flux2_ttr_controller.save_controller_checkpoint(controller, checkpoint_path, trainer=trainer)
                         logger.info(
                             "Flux2TTRControllerTrainer: periodic controller checkpoint saved at step %d/%d: %s",
                             global_step,
@@ -1958,7 +1986,7 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
             pass
 
         if checkpoint_path:
-            flux2_ttr_controller.save_controller_checkpoint(controller, checkpoint_path)
+            flux2_ttr_controller.save_controller_checkpoint(controller, checkpoint_path, trainer=trainer)
 
         if last_original_images is None or last_patched_images is None:
             raise RuntimeError("Flux2TTRControllerTrainer: no samples were produced.")

@@ -100,7 +100,10 @@ class TTRController(nn.Module):
         return (torch.sigmoid(logits.float()) > float(threshold)).to(dtype=torch.float32)
 
 
-def controller_checkpoint_state(controller: TTRController) -> Dict[str, Any]:
+def controller_checkpoint_state(
+    controller: TTRController,
+    trainer: Optional["ControllerTrainer"] = None,
+) -> Dict[str, Any]:
     if not isinstance(controller, TTRController):
         raise TypeError("controller_checkpoint_state expects a TTRController instance.")
     return {
@@ -109,27 +112,41 @@ def controller_checkpoint_state(controller: TTRController) -> Dict[str, Any]:
         "embed_dim": int(controller.embed_dim),
         "hidden_dim": int(controller.hidden_dim),
         "state_dict": {k: v.detach().cpu() for k, v in controller.state_dict().items()},
+        "reward_baseline": float(trainer.reward_baseline) if trainer is not None else None,
+        "reward_count": int(trainer.reward_count) if trainer is not None else None,
+        "optimizer_state_dict": trainer.optimizer.state_dict() if trainer is not None else None,
     }
 
 
-def save_controller_checkpoint(controller: TTRController, checkpoint_path: str) -> None:
+def save_controller_checkpoint(
+    controller: TTRController,
+    checkpoint_path: str,
+    trainer: Optional["ControllerTrainer"] = None,
+) -> None:
     path = (checkpoint_path or "").strip()
     if not path:
         raise ValueError("save_controller_checkpoint: checkpoint_path is required.")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save(controller_checkpoint_state(controller), path)
+    torch.save(controller_checkpoint_state(controller, trainer=trainer), path)
     logger.info("Flux2TTR controller: saved checkpoint to %s", path)
 
 
-def load_controller_checkpoint(checkpoint_path: str, map_location: str | torch.device = "cpu") -> TTRController:
+def load_controller_training_state(
+    checkpoint_path: str,
+    map_location: str | torch.device = "cpu",
+) -> Dict[str, Any]:
     path = (checkpoint_path or "").strip()
     if not path:
-        raise ValueError("load_controller_checkpoint: checkpoint_path is required.")
+        raise ValueError("load_controller_training_state: checkpoint_path is required.")
     payload = torch.load(path, map_location=map_location)
     fmt = payload.get("format")
     if fmt != _CONTROLLER_CHECKPOINT_FORMAT:
-        raise ValueError(f"Flux2TTR controller: unsupported checkpoint format: {fmt!r}")
+        raise ValueError(f"Unsupported checkpoint format: {fmt!r}")
+    return payload
 
+
+def load_controller_checkpoint(checkpoint_path: str, map_location: str | torch.device = "cpu") -> TTRController:
+    payload = load_controller_training_state(checkpoint_path, map_location=map_location)
     controller = TTRController(
         num_layers=int(payload["num_layers"]),
         embed_dim=int(payload.get("embed_dim", 64)),
@@ -219,6 +236,37 @@ class ControllerTrainer:
             self.lambda_eff,
             self.grad_clip_norm,
         )
+
+    @property
+    def reward_baseline(self) -> float:
+        return float(self._reward_baseline)
+
+    @property
+    def reward_count(self) -> int:
+        return int(self._reward_count)
+
+    def restore_training_state(self, payload: Dict[str, Any]) -> None:
+        """Restore reward baseline and optimizer state from a checkpoint payload."""
+        if not isinstance(payload, dict):
+            return
+        if "reward_baseline" in payload and payload["reward_baseline"] is not None:
+            self._reward_baseline = float(payload["reward_baseline"])
+        if "reward_count" in payload and payload["reward_count"] is not None:
+            self._reward_count = int(payload["reward_count"])
+        if "optimizer_state_dict" in payload and payload["optimizer_state_dict"] is not None:
+            try:
+                self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+                target_device = self.controller._input_device_dtype()[0]
+                for state in self.optimizer.state.values():
+                    for key, value in state.items():
+                        if torch.is_tensor(value):
+                            state[key] = value.to(device=target_device)
+            except Exception as exc:
+                logger.warning(
+                    "ControllerTrainer: failed to restore optimizer state (%s). "
+                    "Continuing with fresh optimizer.",
+                    exc,
+                )
 
     @staticmethod
     def _is_inference_tensor(t: torch.Tensor) -> bool:

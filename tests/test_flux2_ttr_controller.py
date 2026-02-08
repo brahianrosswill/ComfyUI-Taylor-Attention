@@ -39,6 +39,55 @@ def test_ttr_controller_checkpoint_round_trip(tmp_path):
     assert torch.allclose(out_a, out_b, atol=1e-6, rtol=1e-6)
 
 
+def test_controller_checkpoint_persists_and_restores_trainer_state(tmp_path):
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, learning_rate=1e-2, target_ttr_ratio=0.6)
+    trainer.reinforce_step(
+        sigma=0.8,
+        cfg_scale=3.0,
+        width=64,
+        height=64,
+        sampled_mask=torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        reward=1.5,
+        actual_full_attn_ratio=0.5,
+    )
+
+    path = tmp_path / "controller_with_trainer_state.pt"
+    flux2_ttr_controller.save_controller_checkpoint(controller, str(path), trainer=trainer)
+    payload = flux2_ttr_controller.load_controller_training_state(str(path))
+
+    assert payload["reward_baseline"] is not None
+    assert payload["reward_count"] is not None
+    assert payload["optimizer_state_dict"] is not None
+
+    loaded_controller = flux2_ttr_controller.load_controller_checkpoint(str(path))
+    restored_trainer = flux2_ttr_controller.ControllerTrainer(loaded_controller, learning_rate=1e-2, target_ttr_ratio=0.6)
+    assert len(restored_trainer.optimizer.state) == 0
+    restored_trainer.restore_training_state(payload)
+
+    assert restored_trainer.reward_baseline == pytest.approx(trainer.reward_baseline)
+    assert restored_trainer.reward_count == trainer.reward_count
+    assert len(restored_trainer.optimizer.state) > 0
+
+
+def test_controller_trainer_restore_training_state_is_backward_compatible():
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0)
+    trainer.restore_training_state(
+        {
+            "format": "flux2_ttr_controller_v1",
+            "num_layers": 2,
+            "embed_dim": 8,
+            "hidden_dim": 16,
+            "state_dict": {k: v.detach().cpu() for k, v in controller.state_dict().items()},
+        }
+    )
+    assert trainer.reward_baseline == pytest.approx(0.0)
+    assert trainer.reward_count == 0
+    assert len(trainer.optimizer.state) == 0
+
+
 def test_controller_trainer_compute_loss_without_lpips():
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
     trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0)

@@ -156,6 +156,7 @@ Flux2TTR is now split into four nodes:
   - `comet_experiment` is normalized to Comet constraints: alphanumeric only, length 32-50. Short values are padded with trailing `X`.
   - Comet run parameters now include flattened training config + run config metadata (`steps`, `cfg`, sampler/scheduler, batch size, controller layers, etc.).
   - When `checkpoint_path` is set, controller training now writes periodic checkpoints every 10 training steps (and once at the end).
+  - Controller checkpoints now persist trainer state (`reward_baseline`, reward sample count, and optimizer state), so resumed runs keep policy momentum instead of re-warming from scratch.
   - Outputs: `IMAGE_ORIGINAL`, `IMAGE_PATCHED`, and `TTR_CONTROLLER`.
 
 - `Flux2TTRController`: inference-time patch node.
