@@ -397,7 +397,14 @@ class ControllerTrainer:
                     )
 
                 if eligible_layer_mask is not None:
-                    eligible = eligible_layer_mask.to(device=logits.device, dtype=torch.bool).reshape(-1)
+                    # ComfyUI can pass inference-mode tensors into nodes; clone here so
+                    # boolean indexing works in autograd-tracked ops below.
+                    eligible = (
+                        eligible_layer_mask.to(device=logits.device, dtype=torch.bool)
+                        .reshape(-1)
+                        .detach()
+                        .clone()
+                    )
                     if eligible.numel() != probs.numel():
                         raise ValueError(
                             "ControllerTrainer.reinforce_step: eligible_layer_mask length "

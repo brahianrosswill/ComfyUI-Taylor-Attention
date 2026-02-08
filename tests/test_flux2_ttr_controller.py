@@ -291,6 +291,33 @@ def test_controller_trainer_reinforce_step_works_under_inference_mode():
     assert metrics["reward"] == pytest.approx(0.8)
 
 
+def test_controller_trainer_reinforce_step_with_eligible_mask_works_under_inference_mode():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, learning_rate=1e-2, target_ttr_ratio=0.5)
+    before = [p.detach().clone() for p in controller.parameters()]
+
+    with torch.inference_mode():
+        eligible = torch.tensor([True, True, False], dtype=torch.bool)
+        metrics = trainer.reinforce_step(
+            sigma=0.6,
+            cfg_scale=3.5,
+            width=64,
+            height=64,
+            sampled_mask=torch.tensor([1.0, 0.0, 1.0]),
+            reward=0.8,
+            actual_full_attn_ratio=0.5,
+            eligible_layer_mask=eligible,
+            actual_full_attn_ratio_overall=2.0 / 3.0,
+        )
+
+    after = list(controller.parameters())
+    assert any(not torch.allclose(b, a.detach()) for b, a in zip(before, after))
+    assert "total_loss" in metrics
+    assert metrics["reward"] == pytest.approx(0.8)
+    assert metrics["eligible_layer_count"] == pytest.approx(2.0)
+
+
 def test_controller_trainer_rebuilds_controller_created_in_inference_mode():
     with torch.inference_mode():
         controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
