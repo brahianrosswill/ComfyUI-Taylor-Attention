@@ -149,6 +149,7 @@ Flux2TTR is now split into four nodes:
   - Uses fixed per-run `controller_mask_override` during patched sampling.
   - Logs Comet metrics with `flux2ttr_controller/*` prefixes when `training_config.logging_config.comet_enabled=true`.
   - Uses `training_config.logging_config.comet_experiment` as a stable Comet experiment key so repeated runs append to one persistent experiment.
+  - `comet_experiment` is normalized to Comet constraints: alphanumeric only, length 30-50. Short values are padded with trailing `X`.
   - Comet run parameters now include flattened training config + run config metadata (`steps`, `cfg`, sampler/scheduler, batch size, controller layers, etc.).
   - Outputs: `IMAGE_ORIGINAL`, `IMAGE_PATCHED`, and `TTR_CONTROLLER`.
 

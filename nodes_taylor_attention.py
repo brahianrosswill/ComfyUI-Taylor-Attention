@@ -143,7 +143,7 @@ def _string_or(value: Any, default: str) -> str:
 
 
 def _default_comet_experiment_name() -> str:
-    return f"exp_{random.getrandbits(64)}"
+    return sweep_utils.normalize_comet_experiment_key(f"exp{random.getrandbits(64)}")
 
 
 def _extract_layer_idx(layer_key: str) -> Optional[int]:
@@ -239,7 +239,7 @@ def _build_training_config_payload(
             "comet_api_key": str(comet_api_key or ""),
             "comet_project_name": str(comet_project_name or "ttr-distillation"),
             "comet_workspace": str(comet_workspace or ""),
-            "comet_experiment": str(comet_experiment or ""),
+            "comet_experiment": sweep_utils.normalize_comet_experiment_key(comet_experiment or ""),
             "log_every": max(1, int(log_every)),
         },
     }
@@ -1501,11 +1501,15 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                 return None
             project_name = _string_or(logging_cfg.get("comet_project_name"), "ttr-distillation")
             workspace = _string_or(logging_cfg.get("comet_workspace"), "").strip() or None
-            experiment_key = _string_or(logging_cfg.get("comet_experiment"), "").strip()
-            if not experiment_key:
-                experiment_key = _default_comet_experiment_name()
-                logging_cfg["comet_experiment"] = experiment_key
-                logger.info("Flux2TTRControllerTrainer: auto-generated comet_experiment=%s", experiment_key)
+            raw_experiment_key = _string_or(logging_cfg.get("comet_experiment"), "")
+            experiment_key = sweep_utils.normalize_comet_experiment_key(raw_experiment_key)
+            logging_cfg["comet_experiment"] = experiment_key
+            if raw_experiment_key != experiment_key:
+                logger.info(
+                    "Flux2TTRControllerTrainer: normalized comet_experiment from %r to %r.",
+                    raw_experiment_key,
+                    experiment_key,
+                )
 
             cached = _CONTROLLER_COMET_EXPERIMENTS.get(experiment_key)
             if cached is not None:

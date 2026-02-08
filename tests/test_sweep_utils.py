@@ -63,3 +63,25 @@ def test_generate_seed_batch_validates_inputs():
         sweep_utils.generate_seed_batch(0, 1, min_value=-1, max_value=10)
     with pytest.raises(ValueError):
         sweep_utils.generate_seed_batch(0, 1, min_value=10, max_value=9)
+
+
+def test_normalize_comet_experiment_key_pads_to_min_length():
+    out = sweep_utils.normalize_comet_experiment_key("abc123")
+    assert len(out) == 30
+    assert out.startswith("abc123")
+    assert out.endswith("X" * (30 - 6))
+    assert out.isalnum()
+
+
+def test_normalize_comet_experiment_key_removes_non_alnum_and_truncates():
+    raw = "exp_123-ABC!" + ("z" * 80)
+    out = sweep_utils.normalize_comet_experiment_key(raw)
+    assert out.isalnum()
+    assert 30 <= len(out) <= 50
+    assert len(out) == 50
+
+
+def test_normalize_comet_experiment_key_generates_default_when_empty():
+    out = sweep_utils.normalize_comet_experiment_key("")
+    assert out.isalnum()
+    assert 30 <= len(out) <= 50

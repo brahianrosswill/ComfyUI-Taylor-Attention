@@ -108,3 +108,25 @@ def generate_seed_batch(
     rng = random.Random(int(seed))
     span = hi - lo + 1
     return [lo + rng.randrange(span) for _ in range(n)]
+
+
+def normalize_comet_experiment_key(
+    value: str | None,
+    *,
+    min_len: int = 30,
+    max_len: int = 50,
+) -> str:
+    if min_len <= 0:
+        raise ValueError("min_len must be > 0.")
+    if max_len < min_len:
+        raise ValueError("max_len must be >= min_len.")
+
+    text = "" if value is None else str(value)
+    key = "".join(ch for ch in text if ch.isalnum())
+    if not key:
+        key = f"exp{random.getrandbits(128):032x}"
+    if len(key) < min_len:
+        key = key + ("X" * (min_len - len(key)))
+    if len(key) > max_len:
+        key = key[:max_len]
+    return key
