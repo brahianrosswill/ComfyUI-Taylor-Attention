@@ -146,6 +146,7 @@ class ControllerTrainer:
         cosine_weight: float = 1.0,
         lpips_weight: float = 0.0,
         target_ttr_ratio: float = 0.7,
+        lambda_eff: float = 1.0,
         grad_clip_norm: float = 1.0,
         device: Optional[torch.device] = None,
     ):
@@ -161,6 +162,7 @@ class ControllerTrainer:
             cosine_weight = float(loss_cfg.get("cosine_weight", cosine_weight))
             lpips_weight = float(loss_cfg.get("lpips_weight", lpips_weight))
             target_ttr_ratio = float(sched_cfg.get("target_ttr_ratio", target_ttr_ratio))
+            lambda_eff = float(sched_cfg.get("lambda_eff", lambda_eff))
             learning_rate = float(opt_cfg.get("learning_rate", learning_rate))
             grad_clip_norm = float(opt_cfg.get("grad_clip_norm", grad_clip_norm))
 
@@ -180,6 +182,7 @@ class ControllerTrainer:
         self.cosine_weight = float(cosine_weight)
         self.lpips_weight = float(lpips_weight)
         self.target_ttr_ratio = float(target_ttr_ratio)
+        self.lambda_eff = max(0.0, float(lambda_eff))
         self.grad_clip_norm = max(0.0, float(grad_clip_norm))
         self._reward_baseline = 0.0
         self._reward_count = 0
@@ -200,7 +203,7 @@ class ControllerTrainer:
         logger.info(
             (
                 "ControllerTrainer initialized: lr=%.6g rmse=%.4g cosine=%.4g lpips=%.4g "
-                "target_ttr_ratio=%.4g target_full_attn_ratio=%.4g grad_clip=%.4g"
+                "target_ttr_ratio=%.4g target_full_attn_ratio=%.4g lambda_eff=%.4g grad_clip=%.4g"
             ),
             float(learning_rate),
             self.rmse_weight,
@@ -208,6 +211,7 @@ class ControllerTrainer:
             self.lpips_weight,
             self.target_ttr_ratio,
             self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio),
+            self.lambda_eff,
             self.grad_clip_norm,
         )
 
@@ -381,7 +385,7 @@ class ControllerTrainer:
         actual_full_attn_ratio_overall: Optional[float] = None,
     ) -> Dict[str, float]:
         self.controller.train()
-        reward_value = float(reward)
+        reward_quality = float(reward)
 
         # ComfyUI often executes nodes in inference_mode; force grad-enabled training here.
         with torch.inference_mode(False):
@@ -423,14 +427,17 @@ class ControllerTrainer:
                 # Restrict policy gradient to controllable layers only.
                 total_log_prob = log_probs[eligible].sum()
 
+                target_full_attn_ratio = self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio)
+                actual_full_attn_eligible = float(mask[eligible].mean().item())
+                efficiency_penalty_value = max(0.0, actual_full_attn_eligible - float(target_full_attn_ratio))
+                efficiency_penalty_weighted = float(self.lambda_eff * efficiency_penalty_value)
+                reward_value = reward_quality - efficiency_penalty_weighted
                 baselined_reward = reward_value - self._reward_baseline
                 self._update_reward_baseline(reward_value)
 
                 policy_loss = -baselined_reward * total_log_prob
-                target_full_attn_ratio = self._target_full_attn_ratio_from_ttr_ratio(self.target_ttr_ratio)
                 probs_mean_eligible = probs[eligible].mean()
-                efficiency_penalty = torch.relu(probs_mean_eligible - float(target_full_attn_ratio))
-                loss = policy_loss + efficiency_penalty
+                loss = policy_loss
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -454,9 +461,11 @@ class ControllerTrainer:
                 )
                 metrics = {
                     "policy_loss": float(policy_loss.detach().item()),
-                    "efficiency_penalty": float(efficiency_penalty.detach().item()),
+                    "efficiency_penalty": float(efficiency_penalty_value),
+                    "efficiency_penalty_weighted": float(efficiency_penalty_weighted),
                     "total_loss": float(loss.detach().item()),
                     "reward": reward_value,
+                    "reward_quality": reward_quality,
                     "reward_baseline": float(self._reward_baseline),
                     "baselined_reward": float(baselined_reward),
                     "mask_mean": mask_mean_eligible,
@@ -477,6 +486,7 @@ class ControllerTrainer:
                     "actual_ttr_ratio_overall": float(1.0 - actual_full_attn_ratio_overall_value),
                     "target_ttr_ratio": float(self.target_ttr_ratio),
                     "target_full_attn_ratio": float(target_full_attn_ratio),
+                    "lambda_eff": float(self.lambda_eff),
                     "eligible_layer_count": float(eligible_count),
                     "total_layer_count": float(total_layer_count),
                     "forced_full_layer_count": float(forced_full_layer_count),

@@ -118,7 +118,7 @@ def test_controller_trainer_training_config_overrides_defaults():
     training_config = {
         "loss_config": {"rmse_weight": 2.5, "cosine_weight": 0.75, "lpips_weight": 0.0},
         "optimizer_config": {"learning_rate": 3e-4, "grad_clip_norm": 0.25},
-        "schedule_config": {"target_ttr_ratio": 0.4},
+        "schedule_config": {"target_ttr_ratio": 0.4, "lambda_eff": 2.25},
     }
     trainer = flux2_ttr_controller.ControllerTrainer(
         controller,
@@ -128,11 +128,13 @@ def test_controller_trainer_training_config_overrides_defaults():
         cosine_weight=7.0,
         lpips_weight=0.0,
         target_ttr_ratio=0.9,
+        lambda_eff=7.0,
         grad_clip_norm=3.0,
     )
     assert trainer.rmse_weight == pytest.approx(2.5)
     assert trainer.cosine_weight == pytest.approx(0.75)
     assert trainer.target_ttr_ratio == pytest.approx(0.4)
+    assert trainer.lambda_eff == pytest.approx(2.25)
     assert trainer.grad_clip_norm == pytest.approx(0.25)
     assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(3e-4)
 
@@ -194,8 +196,11 @@ def test_controller_trainer_reinforce_step_updates_parameters():
     assert any(not torch.allclose(b, a.detach()) for b, a in zip(before, after))
     assert "policy_loss" in metrics_a
     assert "total_loss" in metrics_a
-    assert metrics_a["reward"] == pytest.approx(1.5)
-    assert metrics_a["reward_baseline"] == pytest.approx(1.5)
+    assert metrics_a["efficiency_penalty"] == pytest.approx(0.1)
+    assert metrics_a["reward_quality"] == pytest.approx(1.5)
+    assert metrics_a["reward"] == pytest.approx(1.4)
+    assert metrics_a["total_loss"] == pytest.approx(metrics_a["policy_loss"])
+    assert metrics_a["reward_baseline"] == pytest.approx(1.4)
     assert metrics_b["reward_baseline"] < metrics_a["reward_baseline"]
 
 
@@ -226,7 +231,39 @@ def test_controller_trainer_reinforce_penalty_uses_full_attention_budget():
     assert metrics["probs_mean"] == pytest.approx(0.5)
     assert metrics["expected_full_attn_ratio"] == pytest.approx(0.5)
     assert metrics["expected_ttr_ratio"] == pytest.approx(0.5)
-    assert metrics["efficiency_penalty"] == pytest.approx(0.2, abs=1e-6)
+    assert metrics["efficiency_penalty"] == pytest.approx(0.7, abs=1e-6)
+    assert metrics["reward_quality"] == pytest.approx(0.0)
+    assert metrics["reward"] == pytest.approx(-0.7, abs=1e-6)
+    assert metrics["total_loss"] == pytest.approx(metrics["policy_loss"])
+
+
+def test_controller_trainer_reinforce_penalty_weight_scales_reward():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=16, hidden_dim=32)
+    with torch.no_grad():
+        for param in controller.parameters():
+            param.zero_()
+    trainer = flux2_ttr_controller.ControllerTrainer(
+        controller,
+        learning_rate=0.0,
+        target_ttr_ratio=0.7,
+        lambda_eff=2.0,
+        grad_clip_norm=1.0,
+    )
+    metrics = trainer.reinforce_step(
+        sigma=0.8,
+        cfg_scale=3.0,
+        width=64,
+        height=64,
+        sampled_mask=torch.tensor([1.0, 1.0, 1.0]),
+        reward=0.0,
+        actual_full_attn_ratio=1.0,
+    )
+
+    assert metrics["efficiency_penalty"] == pytest.approx(0.7, abs=1e-6)
+    assert metrics["efficiency_penalty_weighted"] == pytest.approx(1.4, abs=1e-6)
+    assert metrics["reward"] == pytest.approx(-1.4, abs=1e-6)
+    assert metrics["lambda_eff"] == pytest.approx(2.0)
 
 
 def test_controller_trainer_reinforce_penalty_uses_eligible_layers_only():
@@ -255,11 +292,12 @@ def test_controller_trainer_reinforce_penalty_uses_eligible_layers_only():
         actual_full_attn_ratio_overall=1.0,
     )
 
-    # Eligible subset has mean 0.5, so penalty should be exactly zero.
+    # Penalty is based on sampled eligible actions (all ones here), not logits/probs.
     assert metrics["target_full_attn_ratio"] == pytest.approx(0.5)
     assert metrics["probs_mean"] == pytest.approx(0.5, abs=1e-4)
     assert metrics["probs_mean_overall"] > 0.7
-    assert metrics["efficiency_penalty"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["efficiency_penalty"] == pytest.approx(0.5, abs=1e-6)
+    assert metrics["reward"] == pytest.approx(-0.5, abs=1e-6)
     assert metrics["expected_full_attn_ratio"] == pytest.approx(0.5, abs=1e-4)
     assert metrics["expected_full_attn_ratio_overall"] == pytest.approx(0.75, abs=1e-4)
     assert metrics["actual_full_attn_ratio"] == pytest.approx(1.0)
@@ -288,7 +326,8 @@ def test_controller_trainer_reinforce_step_works_under_inference_mode():
     after = list(controller.parameters())
     assert any(not torch.allclose(b, a.detach()) for b, a in zip(before, after))
     assert "total_loss" in metrics
-    assert metrics["reward"] == pytest.approx(0.8)
+    assert metrics["reward_quality"] == pytest.approx(0.8)
+    assert metrics["reward"] == pytest.approx(0.8 - (2.0 / 3.0 - 0.5), abs=1e-6)
 
 
 def test_controller_trainer_reinforce_step_with_eligible_mask_works_under_inference_mode():
@@ -314,6 +353,7 @@ def test_controller_trainer_reinforce_step_with_eligible_mask_works_under_infere
     after = list(controller.parameters())
     assert any(not torch.allclose(b, a.detach()) for b, a in zip(before, after))
     assert "total_loss" in metrics
+    assert metrics["reward_quality"] == pytest.approx(0.8)
     assert metrics["reward"] == pytest.approx(0.8)
     assert metrics["eligible_layer_count"] == pytest.approx(2.0)
 
