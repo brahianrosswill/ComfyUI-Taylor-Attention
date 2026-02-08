@@ -114,7 +114,7 @@ def generate_seed_batch(
 def normalize_comet_experiment_key(
     value: str | None,
     *,
-    min_len: int = 30,
+    min_len: int = 32,
     max_len: int = 50,
 ) -> str:
     if min_len <= 0:
