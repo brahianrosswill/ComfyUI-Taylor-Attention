@@ -1978,13 +1978,14 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             logger.warning(
                                 "Flux2TTRControllerTrainer: sigma-aware policy loss still detached after recompute; "
                                 "skipping optimizer step for this sample. "
-                                "diag: trainable_params=%d/%d inference_tensors=%d probe_requires_grad=%s probe_error=%s repaired_params=%d",
+                                "diag: trainable_params=%d/%d inference_tensors=%d probe_requires_grad=%s probe_error=%s repaired_params=%d recompute_debug=%s",
                                 trainable_params,
                                 int(len(param_list)),
                                 inference_params,
                                 probe_requires_grad,
                                 probe_error or "<none>",
                                 int(repaired),
+                                str(getattr(training_wrapper, "last_recompute_debug", {})),
                             )
                         trainer.optimizer.zero_grad(set_to_none=True)
                         if bool(policy_loss_t.requires_grad):

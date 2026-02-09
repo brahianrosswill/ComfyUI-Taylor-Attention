@@ -124,6 +124,7 @@ class TrainingControllerWrapper(nn.Module):
                 else None
             )
         self.step_records: list[dict[str, Any]] = []
+        self.last_recompute_debug: dict[str, Any] = {}
 
     @staticmethod
     def _scalar(value: float | torch.Tensor) -> float:
@@ -228,6 +229,15 @@ class TrainingControllerWrapper(nn.Module):
             float(sigma_max) if sigma_max is not None else max(float(rec["sigma"]) for rec in self.step_records),
             1e-8,
         )
+        debug: dict[str, Any] = {
+            "steps": int(len(self.step_records)),
+            "any_logits_requires_grad": False,
+            "any_log_probs_requires_grad": False,
+            "any_weighted_requires_grad": False,
+            "result_requires_grad": False,
+            "eligible_counts": [],
+            "used_bool_indexing": False,
+        }
 
         with torch.inference_mode(False):
             with torch.enable_grad():
@@ -242,6 +252,7 @@ class TrainingControllerWrapper(nn.Module):
                     if logits.ndim > 1:
                         logits = logits.reshape(-1)
                     probs = torch.sigmoid(logits.float()).clamp(min=1e-7, max=1.0 - 1e-7)
+                    debug["any_logits_requires_grad"] = bool(debug["any_logits_requires_grad"] or bool(logits.requires_grad))
                     mask = rec["mask"].to(device=probs.device, dtype=probs.dtype).reshape(-1).detach()
                     if int(mask.numel()) != int(probs.numel()):
                         raise ValueError(
@@ -264,13 +275,23 @@ class TrainingControllerWrapper(nn.Module):
                         eligible = torch.ones_like(probs, dtype=torch.bool)
 
                     log_probs = mask * torch.log(probs) + (1.0 - mask) * torch.log(1.0 - probs)
-                    log_prob_sum = log_probs[eligible].sum()
+                    eligible_f = eligible.to(dtype=log_probs.dtype).detach().clone()
+                    debug["eligible_counts"].append(int(eligible.sum().item()))
+                    log_prob_sum = (log_probs * eligible_f).sum()
+                    debug["any_log_probs_requires_grad"] = bool(
+                        debug["any_log_probs_requires_grad"] or bool(log_prob_sum.requires_grad)
+                    )
                     sigma_value = max(0.0, min(1.0, float(rec["sigma"]) / sigma_norm))
                     weight = max(0.1, 1.0 - sigma_value)
                     weighted = float(weight) * log_prob_sum
+                    debug["any_weighted_requires_grad"] = bool(
+                        debug["any_weighted_requires_grad"] or bool(weighted.requires_grad)
+                    )
                     result = weighted if result is None else (result + weighted)
         if result is None:
             raise RuntimeError("TrainingControllerWrapper.sigma_weighted_log_prob_recompute: no terms accumulated.")
+        debug["result_requires_grad"] = bool(result.requires_grad)
+        self.last_recompute_debug = debug
         return result
 
     def per_step_ttr_ratio(self) -> list[tuple[float, float]]:
