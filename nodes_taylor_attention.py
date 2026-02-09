@@ -1700,6 +1700,17 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         controller.to(device=device)
         sigma_aware_training = bool(sigma_aware_training)
+
+        trainer = flux2_ttr_controller.ControllerTrainer(
+            controller=controller,
+            training_config=normalized_cfg,
+            lambda_entropy=float(lambda_entropy),
+            device=device,
+        )
+        # ControllerTrainer may rebuild a trainable controller if the incoming module
+        # was created under inference mode. Ensure runtime/wrapper/checkpoint all
+        # use the trainer-owned instance.
+        controller = trainer.controller
         training_wrapper = flux2_ttr_controller.TrainingControllerWrapper(
             controller,
             temperature=float(gumbel_start),
@@ -1710,13 +1721,6 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         logger.info(
             "Flux2TTRControllerTrainer routing mode: sigma_aware_training=%s",
             sigma_aware_training,
-        )
-
-        trainer = flux2_ttr_controller.ControllerTrainer(
-            controller=controller,
-            training_config=normalized_cfg,
-            lambda_entropy=float(lambda_entropy),
-            device=device,
         )
         if checkpoint_path and os.path.isfile(checkpoint_path):
             try:

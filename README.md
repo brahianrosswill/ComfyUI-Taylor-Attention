@@ -206,6 +206,7 @@ Implementation details:
   - per-step stochastic mask sampling under runtime controller calls
   - trajectory-level policy-gradient aggregation helpers (`total_log_prob`, `sigma_weighted_log_prob`)
   - sigma diagnostics and ratio/entropy summaries for controller training logging
+  - safe integration with inference-mode ComfyUI execution by wiring the runtime wrapper to `trainer.controller` (the trainer-managed trainable copy)
 
 Speed tips:
 - Distill once, then run with `training=false` for normal sampling.

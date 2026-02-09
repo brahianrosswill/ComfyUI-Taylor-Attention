@@ -43,6 +43,20 @@ def test_training_wrapper_records_steps_and_keeps_log_prob_grad_under_no_grad():
     assert bool(total_log_prob.requires_grad)
 
 
+def test_training_wrapper_uses_trainer_rebuilt_controller_from_inference_mode():
+    torch.manual_seed(0)
+    with torch.inference_mode():
+        controller = flux2_ttr_controller.TTRController(num_layers=3, embed_dim=8, hidden_dim=16)
+    trainer = flux2_ttr_controller.ControllerTrainer(controller, lpips_weight=0.0)
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(trainer.controller, temperature=1.0)
+
+    with torch.no_grad():
+        wrapper(sigma=0.4, cfg_scale=4.0, width=64, height=64)
+
+    assert len(wrapper.step_records) == 1
+    assert bool(wrapper.step_records[0]["log_probs"].requires_grad)
+
+
 def test_training_wrapper_synthetic_logits_round_trip_to_sampled_mask(monkeypatch):
     def _fixed_sample(logits: torch.Tensor, temperature: float = 1.0, hard: bool = True) -> torch.Tensor:
         del temperature, hard
