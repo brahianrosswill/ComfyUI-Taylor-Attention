@@ -38,6 +38,8 @@ Inference:
 - `Flux2TTRControllerTrainer` supports `sigma_aware_training` (default `true`) for per-step sigma-dependent routing policy updates.
 - Controller checkpoints persist trainer state (`reward_baseline`, `reward_count`, optimizer state) for stable resume behavior.
 - `Flux2TTRController` exposes `quality_speed` to trade quality and speed through controller thresholding.
+- Flux2TTR landmark selection always includes all conditioning tokens as landmarks; the dynamic landmark budget is now applied only to image/spatial tokens.
+- Runtime accepts conditioning token hints through `transformer_options` keys: `conditioning_token_count`, `cond_token_count`, or `prefix_token_count`.
 
 ## Utility Nodes
 

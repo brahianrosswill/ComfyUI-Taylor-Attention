@@ -88,7 +88,48 @@ def test_flux2_hkr_layer_shape_and_landmarks():
     out = layer(q, k, v, key_mask=key_mask)
     assert out.shape == (1, 2, 7, 8)
     assert torch.isfinite(out).all()
-    assert 1 <= layer.last_landmark_count <= 6
+    assert layer.last_landmark_count == 7
+
+
+def test_flux2_hkr_select_landmarks_keeps_all_conditioning_tokens():
+    layer = flux2_ttr.Flux2HKRAttnLayer(
+        head_dim=8,
+        feature_dim=256,
+        landmark_fraction=0.5,
+        landmark_min=1,
+        landmark_max=6,
+        text_tokens_guess=3,
+    )
+    idx = layer._select_landmarks(
+        num_keys=12,
+        device=torch.device("cpu"),
+        key_mask=None,
+        text_token_count=8,
+        conditioning_token_count=None,
+    )
+    assert idx.numel() == 10
+    assert torch.equal(idx[:8], torch.arange(8, dtype=torch.long))
+
+
+def test_flux2_hkr_conditioning_token_count_overrides_text_token_count():
+    torch.manual_seed(0)
+    layer = flux2_ttr.Flux2HKRAttnLayer(
+        head_dim=8,
+        feature_dim=256,
+        landmark_fraction=0.5,
+        landmark_min=1,
+        landmark_max=6,
+        text_tokens_guess=3,
+    )
+
+    q = torch.randn(1, 2, 7, 8)
+    k = torch.randn(1, 2, 12, 8)
+    v = torch.randn(1, 2, 12, 8)
+    out = layer(q, k, v, text_token_count=2, conditioning_token_count=6)
+
+    assert out.shape == (1, 2, 7, 8)
+    assert torch.isfinite(out).all()
+    assert layer.last_landmark_count == 9
 
 
 def test_flux2_hkr_effective_landmark_count_scales_with_image_tokens():
@@ -123,6 +164,15 @@ def test_runtime_extracts_sigma_and_cfg_scale():
     opts = {"sigmas": torch.tensor([0.35]), "flux2_ttr": {"cfg_scale": 6.5}}
     assert runtime._extract_sigma(opts) == pytest.approx(0.35)
     assert runtime._extract_cfg_scale(opts) == pytest.approx(6.5)
+
+
+def test_runtime_infers_conditioning_token_count():
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    assert runtime._infer_conditioning_token_count({"conditioning_token_count": 12}, 20) == 12
+    assert runtime._infer_conditioning_token_count({"cond_token_count": 9}, 20) == 9
+    assert runtime._infer_conditioning_token_count({"prefix_token_count": 11}, 20) == 11
+    assert runtime._infer_conditioning_token_count({"flux2_ttr": {"conditioning_token_count": 15}}, 20) == 15
+    assert runtime._infer_conditioning_token_count({"text_token_count": 7}, 20) is None
 
 
 def test_runtime_training_uses_query_subsampling_only():
@@ -179,7 +229,13 @@ def test_runtime_replay_stores_sigma_and_cfg():
     q = torch.randn(1, 2, 6, 4)
     k = torch.randn(1, 2, 6, 4)
     v = torch.randn(1, 2, 6, 4)
-    opts = {"block_type": "single", "block_index": 0, "sigmas": torch.tensor([0.42]), "flux2_ttr": {"cfg_scale": 4.0}}
+    opts = {
+        "block_type": "single",
+        "block_index": 0,
+        "sigmas": torch.tensor([0.42]),
+        "conditioning_token_count": 5,
+        "flux2_ttr": {"cfg_scale": 4.0},
+    }
 
     def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
         del pe_arg, transformer_options
@@ -189,6 +245,7 @@ def test_runtime_replay_stores_sigma_and_cfg():
     sample = runtime.replay_buffers["single:0"][-1]
     assert sample.sigma == pytest.approx(0.42)
     assert sample.cfg_scale == pytest.approx(4.0)
+    assert sample.conditioning_token_count == 5
 
 
 def test_runtime_training_preview_uses_student_when_layer_ready():
@@ -220,6 +277,43 @@ def test_runtime_training_preview_uses_student_when_layer_ready():
     assert out.shape == baseline.shape
     assert torch.isfinite(out).all()
     assert not torch.allclose(out, baseline)
+
+
+def test_runtime_inference_propagates_conditioning_token_count_to_layer():
+    torch.manual_seed(0)
+    runtime = flux2_ttr.Flux2TTRRuntime(
+        feature_dim=256,
+        learning_rate=1e-3,
+        training=False,
+        steps=0,
+        readiness_min_updates=0,
+        readiness_threshold=1.0,
+        landmark_fraction=0.5,
+        landmark_min=1,
+        landmark_max=6,
+    )
+    runtime.register_layer_specs([flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4)])
+    runtime.layer_update_count["single:0"] = 1
+    runtime.layer_ema_loss["single:0"] = 0.0
+
+    q = torch.randn(1, 2, 7, 4)
+    k = torch.randn(1, 2, 12, 4)
+    v = torch.randn(1, 2, 12, 4)
+    opts = {
+        "block_type": "single",
+        "block_index": 0,
+        "text_token_count": 2,
+        "conditioning_token_count": 6,
+    }
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    out = runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts, fallback_attention=fallback)
+    assert out.shape == (1, 7, 8)
+    assert torch.isfinite(out).all()
+    assert runtime.layers["single:0"].last_landmark_count == 9
 
 
 def test_runtime_training_uses_randomized_swap_set_per_step(monkeypatch):
@@ -954,6 +1048,38 @@ def test_memory_reserve_estimate_scales_with_landmark_max():
         landmark_max=512,
     )
     assert large > small
+
+
+def test_memory_reserve_estimate_includes_conditioning_token_landmarks():
+    base = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        n_query=256,
+        n_key=4096,
+        head_dim=128,
+        feature_dim=256,
+        q_chunk_size=256,
+        k_chunk_size=1024,
+        dtype_size=4,
+        training=False,
+        landmark_max=128,
+        text_count_estimate=0,
+    )
+    conditioned = flux2_ttr._estimate_flux2_ttr_memory_bytes(
+        batch=1,
+        heads=24,
+        n_query=256,
+        n_key=4096,
+        head_dim=128,
+        feature_dim=256,
+        q_chunk_size=256,
+        k_chunk_size=1024,
+        dtype_size=4,
+        training=False,
+        landmark_max=128,
+        text_count_estimate=256,
+    )
+    assert conditioned > base
 
 
 def test_training_oom_recovery_reduces_pressure_and_clears_layer_buffer():

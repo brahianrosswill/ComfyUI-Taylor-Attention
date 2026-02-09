@@ -86,6 +86,7 @@ class ReplaySample:
     teacher_sub: torch.Tensor
     key_mask: Optional[torch.Tensor]
     text_token_count: Optional[int]
+    conditioning_token_count: Optional[int] = None
     sigma: Optional[float] = None
     cfg_scale: Optional[float] = None
     nbytes: int = 0
@@ -170,6 +171,7 @@ def _estimate_flux2_ttr_memory_bytes(
     dtype_size: int,
     training: bool,
     landmark_max: int = _DEFAULT_LANDMARK_MAX,
+    text_count_estimate: int = _DEFAULT_TEXT_TOKENS_GUESS,
 ) -> int:
     bh = batch * heads
     nq = max(1, int(n_query))
@@ -183,7 +185,10 @@ def _estimate_flux2_ttr_memory_bytes(
     chunk_elems = bh * (k_chunk * feature_dim + k_chunk * head_dim + q_chunk * feature_dim + q_chunk * head_dim)
 
     # Landmark branch: q_chunk x landmarks score matrix and softmax output.
-    landmarks = min(nk, max(1, int(landmark_max)))
+    # Conditioning tokens are always landmarks; image tokens still use the landmark budget.
+    cond_landmarks = min(nk, max(0, int(text_count_estimate)))
+    image_landmarks = min(max(0, nk - cond_landmarks), max(1, int(landmark_max)))
+    landmarks = min(nk, cond_landmarks + image_landmarks)
     landmark_elems = bh * (q_chunk * landmarks + landmarks * head_dim + q_chunk * head_dim)
 
     total = kv_elems + ksum_elems + chunk_elems + landmark_elems
@@ -213,6 +218,9 @@ def _maybe_reserve_memory(
 
     batch, heads, n_query, head_dim = q.shape
     n_key = int(k.shape[2])
+    cond_count_estimate = runtime._infer_conditioning_token_count(transformer_options, n_key)
+    if cond_count_estimate is None:
+        cond_count_estimate = runtime._infer_text_token_count(transformer_options, n_key)
     if training:
         n_query = min(n_query, max(1, int(runtime.training_query_token_cap)))
     dtype_size = torch.tensor([], dtype=dtype_accum).element_size()
@@ -229,6 +237,7 @@ def _maybe_reserve_memory(
         dtype_size=dtype_size,
         training=training,
         landmark_max=runtime.landmark_max,
+        text_count_estimate=cond_count_estimate,
     )
     if training:
         scale = (runtime.feature_dim / 256.0) * (head_dim / 128.0) * max(1.0, (batch * heads) / 24.0)
@@ -251,6 +260,7 @@ def _maybe_reserve_memory(
             runtime.query_chunk_size,
             runtime.key_chunk_size,
             runtime.landmark_max,
+            cond_count_estimate,
             dtype_size,
             _MEMORY_RESERVE_FACTOR,
         )
@@ -508,29 +518,41 @@ class Flux2HKRAttnLayer(nn.Module):
         raw = round(max(0, int(n_image_tokens)) * self.landmark_fraction)
         return max(self.landmark_min, min(self.landmark_max, raw))
 
+    def _resolve_conditioning_token_count(
+        self,
+        num_keys: int,
+        text_token_count: Optional[int],
+        conditioning_token_count: Optional[int],
+    ) -> int:
+        cond_count = conditioning_token_count
+        if cond_count is None:
+            cond_count = self.text_tokens_guess if text_token_count is None else max(0, int(text_token_count))
+        return min(num_keys, max(0, int(cond_count)))
+
     def _select_landmarks(
         self,
         num_keys: int,
         device: torch.device,
         key_mask: Optional[torch.Tensor],
         text_token_count: Optional[int],
-        effective_landmarks: int,
+        conditioning_token_count: Optional[int] = None,
     ) -> torch.Tensor:
         if num_keys <= 0:
             return torch.empty((0,), device=device, dtype=torch.long)
 
-        target = min(int(effective_landmarks), num_keys)
-        text_count = self.text_tokens_guess if text_token_count is None else max(0, int(text_token_count))
-        text_count = min(text_count, num_keys)
+        cond_count = self._resolve_conditioning_token_count(num_keys, text_token_count, conditioning_token_count)
+        cond_idx = torch.arange(0, cond_count, device=device, dtype=torch.long)
 
-        text_idx = self._even_indices(0, text_count, min(text_count, target), device)
-        remaining = max(0, target - text_idx.numel())
-        image_idx = self._even_indices(text_count, num_keys, remaining, device)
+        image_start = cond_count
+        image_length = num_keys - image_start
+        image_budget = min(self._effective_landmark_count(image_length), image_length)
+        image_idx = self._even_indices(image_start, num_keys, image_budget, device)
+        target = cond_count + image_budget
 
-        if text_idx.numel() == 0 and image_idx.numel() == 0:
+        if cond_idx.numel() == 0 and image_idx.numel() == 0:
             idx = torch.tensor([0], device=device, dtype=torch.long)
         else:
-            idx = torch.unique(torch.cat([text_idx, image_idx], dim=0), sorted=True)
+            idx = torch.unique(torch.cat([cond_idx, image_idx], dim=0), sorted=True)
 
         if key_mask is not None:
             valid = key_mask.any(dim=0)
@@ -557,13 +579,17 @@ class Flux2HKRAttnLayer(nn.Module):
         v: torch.Tensor,
         key_mask: Optional[torch.Tensor],
         text_token_count: Optional[int],
+        conditioning_token_count: Optional[int] = None,
     ) -> torch.Tensor:
         batch, heads, _, _ = q.shape
         n_keys = int(k.shape[2])
-        text_count = max(0, int(text_token_count or 0))
-        n_image_tokens = max(0, n_keys - text_count)
-        effective_landmarks = self._effective_landmark_count(n_image_tokens)
-        idx = self._select_landmarks(n_keys, q.device, key_mask, text_token_count, effective_landmarks)
+        idx = self._select_landmarks(
+            n_keys,
+            q.device,
+            key_mask,
+            text_token_count,
+            conditioning_token_count=conditioning_token_count,
+        )
         self.last_landmark_count = int(idx.numel())
         if idx.numel() == 0:
             return v.new_zeros((batch, heads, q.shape[2], v.shape[-1]))
@@ -597,6 +623,7 @@ class Flux2HKRAttnLayer(nn.Module):
         q_chunk: Optional[int] = None,
         k_chunk: Optional[int] = None,
         text_token_count: Optional[int] = None,
+        conditioning_token_count: Optional[int] = None,
         sigma: Optional[float] = None,
         cfg_scale: Optional[float] = None,
     ) -> torch.Tensor:
@@ -619,7 +646,14 @@ class Flux2HKRAttnLayer(nn.Module):
             q_chunk=q_chunk,
             k_chunk=k_chunk,
         )
-        out_land = self._landmark_attention(q, k, v, key_mask=key_mask, text_token_count=text_token_count)
+        out_land = self._landmark_attention(
+            q,
+            k,
+            v,
+            key_mask=key_mask,
+            text_token_count=text_token_count,
+            conditioning_token_count=conditioning_token_count,
+        )
 
         sigma_value = None
         if sigma is not None:
@@ -1403,6 +1437,22 @@ class Flux2TTRRuntime:
                     return min(n_key, value)
         return min(n_key, self.text_tokens_guess)
 
+    def _infer_conditioning_token_count(self, transformer_options: Optional[dict], n_key: int) -> Optional[int]:
+        """Infer total conditioning tokens (text + references + controls), if available."""
+        if not isinstance(transformer_options, dict):
+            return None
+        for key in ("conditioning_token_count", "cond_token_count", "prefix_token_count"):
+            value = transformer_options.get(key)
+            if isinstance(value, int) and value >= 0:
+                return min(n_key, value)
+        inner = transformer_options.get("flux2_ttr")
+        if isinstance(inner, dict):
+            for key in ("conditioning_token_count", "cond_token_count", "prefix_token_count"):
+                value = inner.get(key)
+                if isinstance(value, int) and value >= 0:
+                    return min(n_key, value)
+        return None
+
     def _compute_distill_metrics(
         self,
         student: torch.Tensor,
@@ -1497,6 +1547,7 @@ class Flux2TTRRuntime:
         head_dim: int,
         key_mask: Optional[torch.Tensor],
         text_token_count: Optional[int],
+        conditioning_token_count: Optional[int],
         sigma: Optional[float],
         cfg_scale: Optional[float],
         transformer_options: Optional[dict],
@@ -1529,6 +1580,7 @@ class Flux2TTRRuntime:
                 q_chunk=self.query_chunk_size,
                 k_chunk=self.key_chunk_size,
                 text_token_count=text_token_count,
+                conditioning_token_count=conditioning_token_count,
                 sigma=sigma,
                 cfg_scale=cfg_scale,
             )
@@ -1583,6 +1635,7 @@ class Flux2TTRRuntime:
         text_token_count: Optional[int],
         sigma: Optional[float],
         cfg_scale: Optional[float],
+        conditioning_token_count: Optional[int] = None,
     ) -> None:
         buf = self.replay_buffers.setdefault(layer_key, deque())
         store_device = torch.device("cpu") if self.replay_offload_cpu else q_sub.device
@@ -1617,6 +1670,7 @@ class Flux2TTRRuntime:
             teacher_sub=teacher_store,
             key_mask=key_mask_store,
             text_token_count=text_token_count,
+            conditioning_token_count=conditioning_token_count,
             sigma=self._as_float(sigma),
             cfg_scale=self._as_float(cfg_scale),
             nbytes=int(nbytes),
@@ -1710,6 +1764,7 @@ class Flux2TTRRuntime:
                 q_chunk=self.query_chunk_size,
                 k_chunk=self.key_chunk_size,
                 text_token_count=sample.text_token_count,
+                conditioning_token_count=sample.conditioning_token_count,
                 sigma=sample.sigma,
                 cfg_scale=sample.cfg_scale,
             )
@@ -1802,6 +1857,7 @@ class Flux2TTRRuntime:
         head_dim = spec.head_dim if spec else int(q_eff.shape[-1])
         key_mask = _safe_key_mask(_key_mask_from_mask(mask, q.shape[0], k.shape[2]))
         text_token_count = self._infer_text_token_count(transformer_options, int(k.shape[2]))
+        conditioning_token_count = self._infer_conditioning_token_count(transformer_options, int(k.shape[2]))
 
         teacher_out: Optional[torch.Tensor] = None
         if self.training_mode or not self.layer_ready.get(layer_key, False):
@@ -1858,6 +1914,7 @@ class Flux2TTRRuntime:
                         teacher_sub=teacher_sub,
                         key_mask=key_mask,
                         text_token_count=text_token_count,
+                        conditioning_token_count=conditioning_token_count,
                         sigma=sigma,
                         cfg_scale=cfg_scale,
                     )
@@ -1894,6 +1951,7 @@ class Flux2TTRRuntime:
                     head_dim=head_dim,
                     key_mask=key_mask,
                     text_token_count=text_token_count,
+                    conditioning_token_count=conditioning_token_count,
                     sigma=sigma,
                     cfg_scale=cfg_scale,
                     transformer_options=transformer_options,
@@ -1921,7 +1979,7 @@ class Flux2TTRRuntime:
             width, height = self._extract_resolution(
                 transformer_options,
                 n_key=int(k.shape[2]),
-                text_token_count=text_token_count,
+                text_token_count=conditioning_token_count if conditioning_token_count is not None else text_token_count,
             )
             try:
                 if controller_mask_override is not None:
@@ -2015,6 +2073,7 @@ class Flux2TTRRuntime:
                 head_dim=head_dim,
                 key_mask=key_mask,
                 text_token_count=text_token_count,
+                conditioning_token_count=conditioning_token_count,
                 sigma=sigma,
                 cfg_scale=cfg_scale,
                 transformer_options=transformer_options,
