@@ -1,0 +1,574 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Fonts & encoding ──
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{mathptmx}          % Times Roman text + math
+\usepackage{microtype}
+
+% ── Layout ──
+\usepackage[margin=1in]{geometry}
+\usepackage{setspace}
+\setstretch{1.08}
+\setlength{\parindent}{1.5em}
+\setlength{\parskip}{0.3em}
+
+% ── Math ──
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{bm}
+
+% ── Tables, figures, misc ──
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+% ── Section formatting ──
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\itshape}{\thesubsubsection}{0.5em}{}
+
+% ── Custom commands ──
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\bphi}{\boldsymbol{\phi}}
+\newcommand{\bq}{\mathbf{q}}
+\newcommand{\bk}{\mathbf{k}}
+\newcommand{\bv}{\mathbf{v}}
+\newcommand{\by}{\mathbf{y}}
+\newcommand{\bK}{\mathbf{K}}
+\newcommand{\bV}{\mathbf{V}}
+\newcommand{\bQ}{\mathbf{Q}}
+\newcommand{\bone}{\mathbf{1}}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\ELU}{ELU}
+\DeclareMathOperator{\MLP}{MLP}
+
+% ══════════════════════════════════════════════════════════════
+\begin{document}
+
+% ── Title ──
+\begin{center}
+  {\LARGE\bfseries Flux2TTR: From Taylor Expansion Failure to\\[4pt]
+  Hybrid Kernel-Regression Attention for\\[4pt]
+  Image Diffusion Transformers}
+
+  \bigskip
+
+  {\large\itshape How a Symmetry-Aware Taylor Approximation Proved Unworkable\\
+  and Why Nadaraya--Watson Normalized Kernel Regression\\
+  with Landmark Softmax Residuals Succeeds Where It Failed}
+
+  \bigskip
+
+  Technical Report\,---\,Work in Progress\\[2pt]
+  February 2026
+\end{center}
+
+\vspace{0.5em}
+\noindent\rule{\textwidth}{0.4pt}
+
+% ══════════════════════════════════════════════════════════════
+% ABSTRACT
+% ══════════════════════════════════════════════════════════════
+\begin{center}\textbf{Abstract}\end{center}
+
+\begin{quote}\small
+We report on our attempt to replace quadratic softmax attention in the Flux2 diffusion transformer with linear-time alternatives for high-resolution image generation. Our first approach (\textbf{Flux2TTR~v1}) implemented the symmetry-aware Taylor expansion of Heinsen \& Kozachkov~\citep{heinsen2025}, which decomposes the exponential attention kernel into a truncated polynomial feature map over a minimal monomial basis, achieving $O(1)$ cost per token in theory. Despite extensive engineering---sub-head blocking, Triton fused kernels, auto-tuning of $\bq/\bk$ normalization---the Taylor approach \textbf{failed in practice} for diffusion transformer inference. The fundamental problems were threefold: (1)~the learned feature-map variant we employed dropped the correlation and normalization structure that makes attention function as an associative recall operator; (2)~our bidirectional prefix/suffix scan imposed an artificial raster-order bias incompatible with 2D image structure; and (3)~our online distillation procedure was internally inconsistent, subsampling keys and values alongside queries such that the student was trained on a fundamentally different task than the teacher.
+
+We then redesigned the system from scratch as \textbf{Flux2TTR~v2}, abandoning Taylor expansion entirely in favor of a much simpler architecture: \emph{hybrid normalized kernel-regression attention}. The v2 design combines a Nadaraya--Watson style linear-time branch (using a learned positive feature map with proper denominator normalization) with a small exact softmax attention residual computed against a sparse set of landmark tokens. Training is corrected so that only queries are subsampled while keys and values remain complete, ensuring the student solves the same regression problem as the teacher. Early results on an RTX~4090 show that approximately half of Flux2's attention layers can be distilled to TTR~v2 modules with losses small enough for deployment, and a learned controller can dynamically route layers between full attention and TTR based on per-step quality requirements. The system produces coherent images after only a few hours of training, though further work is needed on controller architecture---particularly incorporating text-token signals to guide routing decisions.
+\end{quote}
+
+\noindent\rule{\textwidth}{0.4pt}
+\vspace{0.5em}
+
+% ══════════════════════════════════════════════════════════════
+% 1. INTRODUCTION
+% ══════════════════════════════════════════════════════════════
+\section{Introduction}
+
+Diffusion transformers such as Flux2~\citep{flux2} achieve state-of-the-art image generation quality, but their self-attention layers scale quadratically with spatial token count, making generation at resolutions beyond $1024\times1024$ prohibitively expensive. For a $4096\times4096$ image at $8\times$ spatial compression, the latent grid contains $n=262{,}144$ tokens; the attention matrix alone would require ${\sim}128$\,GB in float16. Even with FlashAttention's tiled computation~\citep{dao2022}, the raw FLOPs remain $O(n^2)$. This scaling wall is the central obstacle to high-resolution generation on accessible hardware.
+
+Our project set out to break this quadratic barrier by replacing softmax attention with linear-time approximations in selected transformer layers, trained via online distillation from the original model. This paper tells the story of two attempts: a first approach grounded in elegant mathematics that failed in practice, and a second, simpler approach that works.
+
+We believe the failure narrative is as instructive as the success. The literature on efficient attention is vast, but published work naturally emphasizes positive results. The gap between a theoretically sound approximation and a system that produces acceptable images inside a pretrained diffusion pipeline is wider than the theory suggests, and the failure modes are specific and illuminating.
+
+% ══════════════════════════════════════════════════════════════
+% 2. v1: TAYLOR APPROACH
+% ══════════════════════════════════════════════════════════════
+\section{Flux2TTR v1: The Taylor Expansion Approach}
+
+\subsection{Theoretical Foundation}
+
+Our first approach was inspired by Heinsen \& Kozachkov~\citep{heinsen2025}, who showed that the exponential kernel underlying softmax attention can be decomposed via its Taylor expansion into a sum of polynomial feature-map inner products. The key insight is that each power $(\bq^\top\bk)^p$ decomposes into a symmetric tensor product $\bq^{\otimes p}\odot\bk^{\otimes p}$, and the symmetry of this tensor means only
+\begin{equation}
+  m_p = \binom{d+p-1}{p}
+\end{equation}
+unique monomials exist in the upper hyper-triangular region, rather than the full $d^p$ elements. A feature map $\Phi_p:\R^d\to\R^{m_p}$ extracts these unique monomials via precomputed index selection and element-wise products, yielding:
+\begin{equation}\label{eq:taylor}
+  \exp\!\bigl(\bq^\top\bk/c\bigr)
+  \;\approx\;
+  \sum_{p=0}^{P-1} \alpha_p\,
+  \bigl\langle \Phi_p(\bq),\;\Phi_p(\bk)\bigr\rangle_{C_p}
+  \,,\qquad
+  \alpha_p = \frac{1}{p!\,c^p}\,.
+\end{equation}
+
+With $P=4$ Taylor terms and the scaling constant $\alpha_p$ decaying below float16 resolution by the fourth term, this approximation recovers softmax attention to within machine precision. Because the total feature dimension $R = \binom{d+P-1}{P-1}$ is fixed and independent of sequence length, attention becomes $O(n)$ via accumulated feature states, computable by parallel scan.
+
+On paper, this was exactly what we needed: a principled, precision-controllable, linear-time replacement for softmax attention with formal convergence guarantees. We invested substantial engineering effort to make it work in the Flux2 pipeline.
+
+\subsection{Implementation Effort}
+
+Our v1 implementation (the \texttt{taylor\_attention.py}, \texttt{taylor\_sym\_features.py}, and \texttt{taylor\_triton.py} modules) comprised several thousand lines of carefully engineered code addressing the practical challenges of deploying Taylor attention in a diffusion transformer:
+
+\textbf{Sub-head blocking.}\quad Flux2's head dimension $d=128$ produces a feature dimension $R=\binom{131}{3}=373{,}156$ at $P=4$---too large to materialize. We partitioned each head into $B$ independent blocks of dimension $d/B$, applying Taylor attention within each block. At $B=4$ (block dimension~32), $R$ drops to $6{,}545$; at $B=8$ (block dimension~16), $R=876$. This traded cross-block feature interactions for tractable memory.
+
+\textbf{Fused Triton kernels.}\quad For configurations without sub-head blocking, we implemented a streaming Triton kernel that processes Taylor features in chunks, avoiding full materialization of the $R$-dimensional feature tensor. For $P\ge 5$, feature indices were generated on-GPU to avoid enormous Python-side tuple construction.
+
+\textbf{Numerical stability machinery.}\quad We built an extensive stability infrastructure: early denominator probes sampling queries before committing to full computation; fp32 accumulation for denominators; configurable $\bq/\bk$ normalization (L2 clipping, power-law softening); fractional fallback thresholds tolerating a proportion of underflowing denominators; and automatic fallback to exact attention when stability metrics failed.
+
+\textbf{Auto-tuning.}\quad We implemented stochastic hyperparameter search over $\bq/\bk$ normalization parameters during early denoising steps, attempting to find operating points where the Taylor expansion remained numerically well-behaved.
+
+\textbf{Quality monitoring.}\quad We built sampled quality checks comparing Taylor outputs to exact softmax attention at configurable intervals, logging per-step diagnostics including $\bq/\bk$ norm distributions, dot-product percentiles, and cosine similarity statistics.
+
+% ══════════════════════════════════════════════════════════════
+% 3. WHY v1 FAILED
+% ══════════════════════════════════════════════════════════════
+\section{Why the Taylor Approach Failed}
+
+Despite this engineering effort, the Taylor attention backend consistently failed to produce acceptable images when used in Flux2 inference. The failures were not merely a matter of tuning---they reflected fundamental mismatches between the Taylor linear attention formulation and the requirements of a pretrained diffusion transformer. We identify three root causes.
+
+\subsection{Attention as Associative Recall: Lost Normalization Structure}
+
+The deepest problem is theoretical. As recent work has emphasized~\citep{arora2024,schlag2021}, softmax attention functions not merely as a similarity-weighted average but as a \emph{regression-like associative recall operator}. The softmax normalization ensures that attention weights sum to one for each query, creating a proper convex combination of values. This query-dependent normalization is what allows attention to perform sharp retrieval: a query that is very similar to one key and dissimilar to all others will assign nearly all weight to that key's value.
+
+Linear attention mechanisms approximate this by replacing $\softmax(\bQ\bK^\top)\bV$ with:
+\begin{equation}\label{eq:linear-attn}
+  \frac{\bphi(\bQ)\bigl(\bphi(\bK)^\top\bV\bigr)}
+       {\bphi(\bQ)\bigl(\bphi(\bK)^\top\bone\bigr)}
+\end{equation}
+where the denominator provides a form of normalization. However, the quality of this normalization depends critically on the feature map~$\bphi$. The pure Taylor feature map, while mathematically approximating the exponential kernel, produces features that can go negative (higher-order monomial products of signed $\bq/\bk$ values), leading to denominator instability---the very problem our extensive stability machinery was designed to combat.
+
+Our v1 learned feature-map variant compounded this problem. By training a neural network to produce features, we dropped even more of the correlation and normalization structure that makes attention function as associative recall. The learned features had no constraint ensuring positivity, no guarantee of proper normalization, and no covariance correction. The 1D order bias we added via bidirectional prefix/suffix averaging was a patch for a fundamentally broken foundation.
+
+\subsection{Raster-Order Bias in Non-Causal Image Attention}
+
+The original Taylor attention formulation is designed for autoregressive (causal) language models, where tokens have a natural sequential order and attention is computed via recurrence or parallel scan over this sequence. Flux2's single-stream blocks, however, perform \emph{bidirectional} self-attention over a 2D grid of spatial tokens concatenated with text conditioning tokens. There is no natural 1D ordering of image patches.
+
+Our v1 implementation attempted to handle this by running two parallel prefix scans---one forward and one backward along the token sequence---and averaging the results. This bidirectional scan was a heuristic borrowed from bidirectional RNN literature, but it imposed an artificial raster-scan order on the image tokens. The scan's accumulated state at any given token reflected tokens that happened to precede it in the flattened 1D sequence (e.g., all tokens in rows above, plus tokens to the left in the current row), not tokens that were semantically or spatially relevant. This raster-order prior is fundamentally incompatible with the 2D structure of images and introduced systematic directional artifacts.
+
+\subsection{Internally Inconsistent Distillation}
+
+The third failure was in our training procedure. Online distillation requires the student to solve the same problem as the teacher: given a set of queries, keys, and values, produce attention outputs that match the teacher's. Our v1 implementation subsampled queries, keys, and values \emph{jointly} when token counts exceeded a training cap, selecting a random subset of tokens and using only those for both the student's input and the teacher's target.
+
+This created a fundamental mismatch. The teacher's output at any query position is a function of \emph{all} keys and values---the full softmax attention distribution over the entire sequence. By subsampling $\bK$ and $\bV$, we forced the student to match a target that was computed over a different (complete) set of keys than the student could see. The student was effectively learning a different task: ``approximate the attention output over a random subset of keys'' rather than ``approximate the attention output over all keys.'' This inconsistency caused training to stall at high loss or converge to solutions that bore little resemblance to the actual attention patterns needed for generation.
+
+\subsection{Summary of v1 Failure Modes}
+
+\begin{table}[h]
+\centering\small
+\caption{Summary of Flux2TTR v1 failure modes.}
+\label{tab:v1-failures}
+\begin{tabular}{@{}p{2.6cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Failure Mode} & \textbf{Root Cause} & \textbf{Symptom} \\
+\midrule
+Lost normalization structure &
+Learned features lack positivity and proper denominator behavior &
+Denominator underflow, negative weights, numerical instability \\[4pt]
+Raster-order bias &
+Bidirectional 1D scan on 2D image tokens &
+Directional artifacts, poor spatial coherence \\[4pt]
+Inconsistent distillation &
+Joint Q/K/V subsampling; student sees different K/V than teacher used &
+Training stalls at high loss; learned representations diverge from actual attention \\[4pt]
+Feature explosion &
+$\binom{d+P-1}{P-1}$ grows rapidly with head dimension &
+Excessive VRAM; forced sub-head blocking approximation on top of Taylor approximation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════
+% 4. v2: THE REDESIGN
+% ══════════════════════════════════════════════════════════════
+\section{Flux2TTR v2: Hybrid Kernel-Regression Attention}
+
+The v1 failure analysis pointed clearly toward the requirements for a viable design: (a)~preserve query-dependent normalization and locality; (b)~avoid raster-order bias; (c)~ensure the training procedure is internally consistent; and (d)~be fast on GPU without requiring exotic kernel implementations. Rather than attempting to rescue the Taylor formulation, we abandoned it entirely and redesigned from first principles around a much simpler mathematical framework: \textbf{Nadaraya--Watson kernel regression}.
+
+\subsection{Theoretical Motivation: Attention as Kernel Regression}
+
+The connection between attention and kernel regression is well-established~\citep{d2l,tsai2019}. Standard softmax attention computes, for each query~$\bq_i$, a normalized weighted average of values:
+\begin{equation}\label{eq:softmax-nw}
+  y_i
+  = \sum_j \frac{\exp(\bq_i^\top \bk_j / \sqrt{d})}
+               {\sum_\ell \exp(\bq_i^\top \bk_\ell / \sqrt{d})}\,\bv_j\,.
+\end{equation}
+
+This is precisely the \emph{Nadaraya--Watson kernel regression estimator}~\citep{nadaraya1964,watson1964} with the exponential dot-product kernel $K(\bq,\bk)=\exp(\bq^\top\bk/\sqrt{d})$. The estimator computes a locally-weighted average of ``responses'' (values) where the weights are determined by the ``similarity'' (kernel evaluation) between the ``query point'' and each ``training point'' (key). The denominator ensures weights sum to one---this is the normalization that our v1 approach fatally neglected.
+
+The Nadaraya--Watson perspective immediately suggests the simplest possible linearization that preserves the normalization structure: replace the exponential kernel with any positive kernel that can be decomposed as an inner product of positive feature maps:
+\begin{equation}\label{eq:nw-linear}
+  y_i
+  = \frac{\sum_j \bigl(\bphi(\bq_i)\cdot\bphi(\bk_j)\bigr)\,\bv_j}
+         {\sum_j \bigl(\bphi(\bq_i)\cdot\bphi(\bk_j)\bigr) + \varepsilon}
+\end{equation}
+where $\bphi(\cdot):\R^d\to\R^F_+$ is a learned feature map constrained to produce \emph{positive} outputs. This is the closest ``TTR-ish'' approximation to attention that remains linear-time and does not require $\bK^\top\bK$ inverses. The positivity constraint is essential: it ensures the denominator is always positive (eliminating the instability that plagued v1), the attention weights are non-negative (preserving the convex-combination property), and the normalization is meaningful (weights sum to a well-defined positive quantity).
+
+\subsection{Architecture: Two-Branch Hybrid}
+
+Pure kernel regression attention, while theoretically sound and linear-time, has known failure modes inherited from all linear attention variants: it struggles with sharp retrieval (where one key should dominate), rare correlations, and compositional binding~\citep{arora2024}. These are precisely the interactions where the softmax's exponential amplification matters most. Rather than accepting this quality gap, v2 compensates with a small exact-attention residual computed against a sparse set of landmark tokens. The full architecture is:
+\begin{equation}\label{eq:hybrid}
+  \boxed{\;\text{Output}
+  = \underbrace{\text{Normalized Kernel Linear Attention}}_{\text{Branch A (linear-time)}}
+  + \;\alpha\cdot\underbrace{\text{Landmark Softmax Residual}}_{\text{Branch B (quality rescue)}}\;}
+\end{equation}
+
+\subsubsection{Branch A: Nadaraya--Watson Kernel Attention}
+
+Branch~A computes normalized kernel regression in linear time using chunked accumulation. The learned positive feature map $\bphi$ is implemented as an MLP followed by an $\ELU{+}1$ activation:
+\begin{equation}\label{eq:phi}
+  \bphi(\mathbf{x}) = \ELU\bigl(\MLP(\mathbf{x})\bigr) + 1\,,
+\end{equation}
+which guarantees strictly positive features. Separate feature networks $\bphi_q$ and $\bphi_k$ are optionally supported but we default to shared weights. The computation proceeds in two phases:
+
+\textbf{Accumulation phase} (one pass over keys, chunked). Compute the global numerator matrix and denominator vector, both accumulated in fp32 regardless of inference dtype:
+\begin{align}
+  \mathbf{S} &= \sum_{j=1}^{n} \bphi(\bk_j)\,\bv_j^\top
+  \;\in\;\R^{F\times d_v}\,,\label{eq:S}\\[4pt]
+  \mathbf{z} &= \sum_{j=1}^{n} \bphi(\bk_j)
+  \;\in\;\R^{F}\,.\label{eq:z}
+\end{align}
+
+\textbf{Evaluation phase} (one pass over queries, chunked). For each query $\bq_i$:
+\begin{equation}\label{eq:eval}
+  y_i = \frac{\bphi(\bq_i)^\top \mathbf{S}}
+             {\bphi(\bq_i)^\top \mathbf{z} + \varepsilon}\,.
+\end{equation}
+
+Crucially, no $n\times n$ matrix is ever formed or tiled. The dominant cost is $O(n\cdot F\cdot d_v)$ where $F$ is the feature dimension (typically~256), making the computation genuinely linear in token count.
+
+Equally crucial is what Branch~A does \emph{not} do: there is no bidirectional scan, no prefix/suffix averaging, no raster-order traversal. The global sums in Equations~\eqref{eq:S}--\eqref{eq:z} are commutative---the order in which key chunks are accumulated is irrelevant. This eliminates the directional artifacts that plagued v1 and respects the inherent 2D isotropy of image attention.
+
+\subsubsection{Branch B: Landmark Softmax Residual}
+
+Branch~B performs exact softmax attention from all queries to a small set of $M$ landmark tokens (typically 64--256). Landmark selection is deterministic: all text conditioning tokens are included (as they carry critical semantic information), plus uniformly-spaced image tokens to fill the remaining budget. Effective landmarks scale dynamically:
+\begin{equation}\label{eq:landmarks}
+  M_\text{eff} = \mathrm{clamp}\bigl(\lfloor n\cdot f\rceil,\; M_\text{min},\; M_\text{max}\bigr)
+\end{equation}
+where $f$ is a configurable fraction (default~0.08), $M_\text{min}=64$, $M_\text{max}=512$.
+
+The landmark attention cost is $O(n\cdot M\cdot d)$, which for $M=128$ and $n=16{,}384$ ($1024\times1024$ image) is approximately $128\times$ cheaper than full $n\times n$ attention. The landmark output is mixed in with a per-head learnable scalar~$\alpha$, initialized near zero so that the kernel branch dominates during early training:
+\begin{equation}\label{eq:gate}
+  \by_i = \by_i^{\,\text{kernel}} + \alpha\cdot\by_i^{\,\text{landmark}}\,.
+\end{equation}
+
+The landmark branch serves as a ``quality rescue'' mechanism, compensating for the known limitations of kernel attention by providing a small dose of exact softmax computation at the tokens most likely to carry globally-relevant information. Because the landmark set always includes text tokens, the system preserves the text-to-image cross-attention pathways that are critical for prompt adherence.
+
+% ══════════════════════════════════════════════════════════════
+% 5. CORRECTED TRAINING
+% ══════════════════════════════════════════════════════════════
+\section{Corrected Online Distillation}
+
+\subsection{The Key Fix: Subsample Queries, Not Keys}
+
+The single most important change in v2's training pipeline is deceptively simple: \textbf{subsample only queries; keep the complete key/value set}. During each training step, the teacher computes full softmax attention over all tokens normally. A random subset of query indices ($64$--$256$ tokens) is selected. The student receives the subsampled queries but the \emph{complete} key and value tensors, and must match the teacher's output at the selected query positions.
+
+This ensures the student solves exactly the same regression problem as the teacher: ``given all keys and values, what should the attention output be at these query positions?'' The student's kernel attention module sees the full key set in its accumulation phase (Equations~\ref{eq:S}--\ref{eq:z}) and the full landmark set in its softmax branch. The only subsampling is on the query side, which is legitimate because the teacher's output at each query position is independent of which other queries are being evaluated.
+
+Formally, let $\mathcal{I}\subset\{1,\ldots,n\}$ with $|\mathcal{I}|=n_q\ll n$ be a randomly selected set of query indices. The distillation loss is:
+\begin{equation}\label{eq:distill}
+  \mathcal{L} = \frac{1}{n_q}\sum_{i\in\mathcal{I}}
+  \bigl\|\,f_\text{student}(\bq_i;\;\bK,\bV) - f_\text{teacher}(\bq_i;\;\bK,\bV)\bigr\|^2
+\end{equation}
+where both student and teacher receive the \emph{same} complete $\bK\in\R^{n\times d}$ and $\bV\in\R^{n\times d_v}$. This single change massively improved learnability. Where v1's distillation would stall at high loss indefinitely, v2's loss curves show clear convergence, with many layers reaching deployment thresholds within hundreds of training steps.
+
+\subsection{Per-Layer Replay Buffers and Readiness Gating}
+
+Training on consecutive attention calls within a single denoising trajectory produces highly correlated gradients. We address this with per-layer replay buffers that store $(\bq_\text{sub}, \bK, \bV, \by_\text{teacher})$ tuples from previous steps, globally budgeted across all layers to a configurable memory cap (default 768\,MB) with oldest-sample eviction. Multiple training steps draw random minibatches from the buffer, providing temporal diversity across denoising timesteps and reducing overfitting to any single noise level.
+
+Each layer maintains an exponential moving average of its training loss:
+\begin{equation}
+  \bar{\mathcal{L}}_t = \beta\,\bar{\mathcal{L}}_{t-1} + (1-\beta)\,\mathcal{L}_t\,,
+  \qquad \beta=0.9\,.
+\end{equation}
+A layer is flagged as ``ready'' for deployment only when $\bar{\mathcal{L}} < \tau$ (configurable threshold) and it has accumulated a minimum number of training updates. Non-ready layers are clamped to full attention during inference regardless of the controller's output.
+
+\subsection{Loss Function and Optimization}
+
+The training loss combines three terms:
+\begin{equation}\label{eq:loss}
+  \mathcal{L} = w_\text{rmse}\cdot\mathcal{L}_\text{RMSE}
+              + w_\text{cos}\cdot(1 - \cos\text{-sim})
+              + w_\text{lpips}\cdot\mathcal{L}_\text{LPIPS}
+\end{equation}
+where RMSE captures overall magnitude, cosine dissimilarity captures directional alignment in the high-dimensional output space, and LPIPS~\citep{zhang2018} (computed by decoding both outputs to pixel space) ensures the distillation preserves perceptually-relevant structure. Optimization uses AdamW with separate learning rates for the feature-map parameters (lower) and the gate/$\alpha$ parameters (higher), plus gradient clipping at norm~1.0 for stability.
+
+% ══════════════════════════════════════════════════════════════
+% 6. CONTROLLER
+% ══════════════════════════════════════════════════════════════
+\section{Phase 2: Learned Dynamic Controller}
+
+Once TTR layers have been distilled, a binary controller is trained to decide per-layer, per-denoising-step routing. The controller runs dual-path sampling: the original model as teacher versus the TTR-patched model as student. It computes quality deltas ($\Delta$RMSE, $\Delta$cosine, $\Delta$LPIPS) between the two paths and updates its routing policy via REINFORCE~\citep{williams1992}, with the reward balancing image quality against a configurable efficiency target (the fraction of layers routed to TTR).
+
+The controller uses Gumbel-Softmax relaxation during training, annealing temperature from a warm start to near-deterministic selection. At inference, a quality/speed slider maps to a probability threshold: $0.0$ favors maximum TTR usage (threshold~$0.1$), $1.0$ favors full attention (threshold~$0.9$). Efficiency targets are computed only over readiness-qualified layers, with both eligible-layer and overall ratios logged for interpretability.
+
+Critically, the controller currently operates only on layer index and diffusion timestep ($\sigma$) information. It does not examine text tokens or image content. We believe this is a significant limitation: intuitively, some prompts require more precise attention (e.g., detailed spatial compositions, text rendering) while others are more tolerant of approximation (e.g., simple scenes, abstract imagery). Future work will extend the controller with a small MLP that extracts signal from the text conditioning tokens to guide routing decisions.
+
+% ══════════════════════════════════════════════════════════════
+% 7. COMPUTATIONAL ANALYSIS
+% ══════════════════════════════════════════════════════════════
+\section{Computational Analysis}
+
+\subsection{Asymptotic Complexity}
+
+For a single attention head with $n$ tokens, head dimension~$d$, and TTR feature dimension~$F$:
+
+\begin{table}[h]
+\centering\small
+\caption{Complexity comparison. $F$ is the learned feature dimension (typically~256), $M$ is landmark count (64--512), $R$ is the Taylor feature dimension.}
+\label{tab:complexity}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Method} & \textbf{Time Complexity} & \textbf{Memory (attention)} \\
+\midrule
+Softmax (standard)          & $O(n^2 d)$            & $O(n^2)$ \\
+Softmax (FlashAttention)    & $O(n^2 d)$            & $O(n)$ \\
+Taylor v1 ($P{=}4$, $B{=}4$) & $O(nRd)$, $R{=}6{,}545$ & $O(Rd)$ fixed state \\
+TTR v2 Branch~A             & $O(nFd)$, $F{\approx}256$ & $O(Fd)$ fixed state \\
+TTR v2 Branch~B             & $O(nMd)$, $M{\approx}128$ & $O(nM)$ \\
+TTR v2 combined             & $O\bigl(n(F{+}M)d\bigr)$ & $O(Fd + nM)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Note that v2's Branch~A feature dimension ($F\approx 256$) is dramatically smaller than v1's Taylor feature dimension ($R=6{,}545$ at the aggressive $B=4$ sub-head blocking, and $373{,}156$ without blocking). This is because v2 uses a \emph{learned} feature map of arbitrary dimension rather than a combinatorially-determined polynomial basis. The feature map learns to compress the relevant structure into a compact representation, trading the Taylor approach's formal approximation guarantees for practical efficiency and trainability.
+
+\subsection{Concrete Speedup Estimates}
+
+\begin{table}[h]
+\centering\small
+\caption{Estimated attention FLOPs per layer: full softmax vs.\ TTR~v2 ($F{=}256$, $M{=}128$, $d{=}128$, 24 heads, $8\times$ spatial compression). Estimates are order-of-magnitude for dominant operations.}
+\label{tab:speedup}
+\begin{tabular}{@{}lrcrc@{}}
+\toprule
+\textbf{Resolution} & $\bm{n}$ & \textbf{Full attention} & \textbf{TTR v2} & \textbf{Ratio} \\
+\midrule
+$512\times512$    & 4,096    & ${\sim}2.1\times10^{9}$  & ${\sim}4.0\times10^{8}$  & ${\sim}5\times$ \\
+$1024\times1024$  & 16,384   & ${\sim}3.4\times10^{10}$ & ${\sim}1.6\times10^{9}$  & ${\sim}21\times$ \\
+$2048\times2048$  & 65,536   & ${\sim}5.5\times10^{11}$ & ${\sim}6.3\times10^{9}$  & ${\sim}87\times$ \\
+$4096\times4096$  & 262,144  & ${\sim}8.8\times10^{12}$ & ${\sim}2.5\times10^{10}$ & ${\sim}350\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The speedup remains approximately linear in~$n$ because Branch~A is $O(n)$ and Branch~B is $O(n\cdot M)$ where $M$ is constant. At $4096\times4096$, the per-layer speedup exceeds two orders of magnitude. If approximately half of the model's attention layers can be replaced (as our early results suggest), the end-to-end attention compute is reduced by roughly 50\%, with each substituted layer contributing a ${>}100\times$ reduction at $2048{+}$ resolution.
+
+% ══════════════════════════════════════════════════════════════
+% 8. EARLY RESULTS
+% ══════════════════════════════════════════════════════════════
+\section{Early Results and Status}
+
+Flux2TTR v2 is a work in progress. However, early training on a single RTX~4090 provides encouraging evidence that the approach is viable.
+
+\subsection{Layer Distillation}
+
+After a few hours of online distillation during normal image generation workflows, approximately half of Flux2's single-stream attention layers converge to EMA losses below the deployment threshold. These layers span primarily the middle and later blocks, consistent with the intuition that early layers (which establish coarse global structure) require more precise attention, while later layers (which refine local detail within an already-structured representation) tolerate the kernel regression approximation. The aggregate training snapshots logged every 10~updates show clear loss convergence with q25--q75 ranges for per-layer loss, cosine similarity, and NMSE all tightening over time.
+
+\subsection{Image Quality}
+
+Images generated with TTR~v2 substitution on ready layers are in many cases coherent enough to be used. The most common degradation is a subtle softening of fine texture and high-frequency detail, consistent with the kernel attention's smoothing bias. Prompt adherence, global composition, and color fidelity are largely preserved, likely thanks to the landmark branch's inclusion of all text tokens in its exact-attention set.
+
+\subsection{Controller Routing}
+
+The REINFORCE-trained controller learns meaningful routing patterns: it routes more layers to TTR during early denoising steps (high~$\sigma$ / high noise, where attention patterns are diffuse) and falls back to full attention during later steps (low~$\sigma$, where fine detail matters). This sigma-dependent routing emerges naturally from the quality/efficiency reward signal without explicit scheduling.
+
+% ══════════════════════════════════════════════════════════════
+% 9. v1 vs v2 COMPARISON
+% ══════════════════════════════════════════════════════════════
+\section{Comparison: v1 vs.\ v2}
+
+\begin{table}[h]
+\centering\small
+\caption{Detailed comparison of Flux2TTR v1 (Taylor) and v2 (kernel regression) architectures.}
+\label{tab:comparison}
+\begin{tabular}{@{}p{2.4cm}p{4.5cm}p{4.5cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{TTR v1 (Taylor)} & \textbf{TTR v2 (Kernel Regression)} \\
+\midrule
+Core math &
+Truncated Taylor expansion of $\exp$ kernel; polynomial feature map over minimal monomial basis &
+Nadaraya--Watson normalized kernel regression with learned positive feature map \\[4pt]
+Feature map &
+Deterministic (symmetric tensor indices) or learned (unconstrained) &
+Learned MLP + $\ELU{+}1$ (guaranteed positive) \\[4pt]
+Feature dimension &
+$\binom{d/B+P-1}{P-1}$; e.g.\ 6,545 ($B{=}4$) or 373,156 ($B{=}1$) &
+Configurable; typically 256 \\[4pt]
+Normalization &
+Denominator from Taylor features; can go negative &
+Strictly positive denominator; proper Nadaraya--Watson normalization \\[4pt]
+Scan structure &
+Bidirectional prefix/suffix scan (raster-order bias) &
+Global commutative sums (order-independent) \\[4pt]
+Quality rescue &
+None (fallback to full attention on failure) &
+Landmark softmax residual (64--512 tokens, learnable gate) \\[4pt]
+Distillation &
+Joint Q/K/V subsampling (internally inconsistent) &
+Query-only subsampling; full K/V preserved \\[4pt]
+Practical result &
+Failed to produce acceptable images after extensive tuning &
+${\sim}50\%$ of layers distillable; coherent images after hours of training \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════
+% 10. LESSONS & FUTURE WORK
+% ══════════════════════════════════════════════════════════════
+\section{Lessons Learned and Future Directions}
+
+\subsection{Lessons from the Failure}
+
+Our experience with v1 yields several lessons for the efficient attention community.
+
+First, \textbf{theoretical approximation quality is necessary but not sufficient}. The Taylor expansion approximates the exponential kernel to arbitrary precision in exact arithmetic, but this guarantee is of limited value when the resulting features are numerically unstable in reduced-precision computation, require aggressive blocking that introduces its own approximation error, and are deployed inside a model not trained to tolerate any approximation at all.
+
+Second, \textbf{the structure of the normalization matters more than the structure of the kernel}. Our v1 approximated the exponential kernel with mathematical precision but destroyed the normalization structure that makes attention function as associative recall. Our v2 makes no attempt to approximate the exponential kernel at all---it uses an entirely different, learned kernel---but preserves the Nadaraya--Watson normalization structure perfectly. The latter turns out to be far more important for producing usable outputs.
+
+Third, \textbf{distillation setup errors dominate approximation errors}. Our v1's most damaging bug was not in the attention math but in the training loop: subsampling K/V alongside Q created a task mismatch that no amount of architectural improvement could overcome. The v2 fix was trivial (subset queries only, keep full K/V), but getting there required understanding \emph{why} training was stalling, not just observing \emph{that} it was.
+
+\subsection{Current Limitations}
+
+Several important limitations remain. The landmark softmax branch, while much cheaper than full attention, still scales as $O(n\cdot M)$, contributing to memory pressure at very high resolutions. The controller architecture is currently blind to prompt content---it cannot distinguish a prompt requiring precise spatial composition (``a red ball on the left and a blue ball on the right'') from one tolerant of approximation (``a sunset over the ocean''). The distillation requires running the teacher model alongside the student during training, roughly doubling compute cost during the training phase.
+
+\subsection{Future Work}
+
+\textbf{Text-aware controller.}\quad The most immediate priority is extending the controller to incorporate text token information. We plan to add a small MLP that processes a compressed representation of the text conditioning (e.g., mean-pooled CLIP/T5 embeddings concatenated with $\sigma$ and layer index) to predict which layers are safe to swap for the current prompt. We hypothesize that prompts involving precise spatial relationships, numeracy, or text rendering will require more layers at full attention.
+
+\textbf{2D-aware landmarks.}\quad The current uniform landmark selection ignores image spatial structure. Stratified 2D grid sampling, potentially augmented with norm-based importance sampling, could improve the landmark branch's coverage of semantically relevant regions.
+
+\textbf{Multiple kernel memories.}\quad Replacing the single $\mathbf{S}/\mathbf{z}$ accumulator with a mixture of $M_\text{mem}$ separate memory banks (4--8), each receiving gated contributions from the key side and queried with learned gating weights, would add nonlinearity resembling multiple ``attention clusters'' without quadratic cost.
+
+\textbf{Local window hybrid.}\quad Adding exact attention over a small local window (e.g., $7\times7$ spatial neighborhood) for image tokens, computed alongside the global kernel attention, could restore fine-grained spatial detail.
+
+\textbf{Offline distillation with diverse prompts.}\quad The current online training is limited by the prompts the user happens to generate. A dedicated offline distillation phase using a curated diverse prompt set would improve coverage and reduce the risk of catastrophic forgetting on out-of-distribution prompts.
+
+% ══════════════════════════════════════════════════════════════
+% 11. CONCLUSION
+% ══════════════════════════════════════════════════════════════
+\section{Conclusion}
+
+We have presented the development of Flux2TTR in two phases. The first, based on the mathematically elegant symmetry-aware Taylor expansion of the exponential attention kernel, failed despite extensive engineering effort. The failure was instructive: it demonstrated that preserving the normalization structure of attention (as a Nadaraya--Watson kernel regression estimator) matters more than precisely approximating the exponential kernel, that bidirectional sequential scans impose unacceptable ordering biases on 2D image data, and that distillation training is exquisitely sensitive to mismatches between what the student sees and what the teacher computed.
+
+The second approach, Flux2TTR~v2, succeeds by being simpler. It replaces the combinatorially complex Taylor polynomial features with a compact learned positive feature map, eliminates sequential scans in favor of commutative global sums, adds a small exact-attention residual to rescue quality on hard retrieval problems, and fixes the distillation procedure to ensure student--teacher task consistency. Early results show that roughly half of Flux2's attention layers can be distilled to the kernel-regression approximation after a few hours of training on a single RTX~4090, producing images that are in many cases coherent enough for use.
+
+The work remains in progress. The controller needs text-awareness, the landmark strategy needs spatial intelligence, and the system needs extensive evaluation on diverse prompts and resolutions. But the fundamental bet---that a well-normalized, properly-trained linear attention module can replace exact softmax attention in a substantial fraction of a diffusion transformer's layers---appears to be paying off. If the remaining challenges can be addressed, Flux2TTR~v2 has the potential to make high-resolution image generation at $2048\times2048$ and beyond practical on consumer hardware, breaking the quadratic attention barrier not through mathematical elegance but through engineering pragmatism.
+
+% ══════════════════════════════════════════════════════════════
+% REFERENCES
+% ══════════════════════════════════════════════════════════════
+\begin{thebibliography}{18}
+
+\bibitem[Arora et~al.(2024)]{arora2024}
+S.~Arora, S.~Eyuboglu, A.~Timalsina, I.~Johnson, M.~Poli, J.~Zou, A.~Rudra, and C.~R\'{e}.
+\newblock Simple linear attention language models balance the recall-throughput tradeoff.
+\newblock In \emph{Proceedings of ICML}, 2024.
+
+\bibitem[Black Forest Labs(2024--2025)]{flux2}
+Black Forest Labs.
+\newblock Flux and Flux2: Open diffusion transformer models.
+\newblock 2024--2025.
+
+\bibitem[Choromanski et~al.(2020)]{choromanski2020}
+K.~Choromanski, V.~Likhosherstov, D.~Dohan, X.~Song, A.~Gane, T.~Sarlos, P.~Hawkins, J.~Davis, A.~Mohiuddin, L.~Kaiser, D.~Belanger, L.~Colwell, and A.~Weller.
+\newblock Rethinking attention with Performers.
+\newblock In \emph{Proceedings of ICLR}, 2021.
+
+\bibitem[D2L.ai()]{d2l}
+D2L.ai.
+\newblock Chapter 10.2: Attention pooling: Nadaraya--Watson kernel regression.
+\newblock In \emph{Dive into Deep Learning}.
+
+\bibitem[Dao et~al.(2022)]{dao2022}
+T.~Dao, D.~Fu, S.~Ermon, A.~Rudra, and C.~R\'{e}.
+\newblock Flash{A}ttention: Fast and memory-efficient exact attention with {IO}-awareness.
+\newblock In \emph{Advances in NeurIPS}, 2022.
+
+\bibitem[Heinsen \& Kozachkov(2025)]{heinsen2025}
+F.~A.~Heinsen and L.~Kozachkov.
+\newblock Self-attention at constant cost per token via symmetry-aware {T}aylor approximation.
+\newblock \emph{arXiv:2602.00294}, 2025.
+
+\bibitem[Hinton et~al.(2015)]{hinton2015}
+G.~Hinton, O.~Vinyals, and J.~Dean.
+\newblock Distilling the knowledge in a neural network.
+\newblock In \emph{NIPS Deep Learning Workshop}, 2015.
+
+\bibitem[Katharopoulos et~al.(2020)]{katharopoulos2020}
+A.~Katharopoulos, A.~Vyas, N.~Pappas, and F.~Fleuret.
+\newblock Transformers are {RNN}s: Fast autoregressive transformers with linear attention.
+\newblock In \emph{Proceedings of ICML}, 2020.
+
+\bibitem[Nadaraya(1964)]{nadaraya1964}
+E.~A.~Nadaraya.
+\newblock On estimating regression.
+\newblock \emph{Theory of Probability and Its Applications}, 9(1):141--142, 1964.
+
+\bibitem[Nauen et~al.(2024)]{nauen2024}
+J.~Nauen, et~al.
+\newblock {TaylorShift}: Shifting the complexity of self-attention from squared to linear (and back) using {T}aylor-softmax.
+\newblock \emph{arXiv:2403.02920}, 2024.
+
+\bibitem[Peebles \& Xie(2023)]{peebles2023}
+W.~Peebles and S.~Xie.
+\newblock Scalable diffusion models with transformers.
+\newblock In \emph{Proceedings of ICCV}, 2023.
+
+\bibitem[Schlag et~al.(2021)]{schlag2021}
+I.~Schlag, K.~Irie, and J.~Schmidhuber.
+\newblock Linear transformers are secretly fast weight programmers.
+\newblock In \emph{Proceedings of ICML}, 2021.
+
+\bibitem[Su et~al.(2021)]{su2021}
+J.~Su, Y.~Lu, S.~Pan, A.~Murtadha, B.~Wen, and Y.~Liu.
+\newblock {RoFormer}: Enhanced transformer with rotary position embedding.
+\newblock \emph{arXiv:2104.09864}, 2021.
+
+\bibitem[Tsai et~al.(2019)]{tsai2019}
+Y.-H.~Tsai, S.~Bai, M.~Yamada, A.~Arik, T.~Shim, Y.~Pfister, and R.~Salakhutdinov.
+\newblock Transformer dissection: An unified understanding for transformer's attention via the lens of kernel.
+\newblock In \emph{Proceedings of EMNLP}, 2019.
+
+\bibitem[Vaswani et~al.(2017)]{vaswani2017}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N.~Gomez, {\L}.~Kaiser, and I.~Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{Advances in NeurIPS}, 2017.
+
+\bibitem[Watson(1964)]{watson1964}
+G.~S.~Watson.
+\newblock Smooth regression analysis.
+\newblock \emph{Sankhy\={a}: The Indian Journal of Statistics, Series A}, 26(4):359--372, 1964.
+
+\bibitem[Williams(1992)]{williams1992}
+R.~J.~Williams.
+\newblock Simple statistical gradient-following algorithms for connectionist reinforcement learning.
+\newblock \emph{Machine Learning}, 8(3--4):229--256, 1992.
+
+\bibitem[Zhang et~al.(2018)]{zhang2018}
+R.~Zhang, P.~Isola, A.~A.~Efros, E.~Shechtman, and O.~Wang.
+\newblock The unreasonable effectiveness of deep features as a perceptual metric.
+\newblock In \emph{Proceedings of CVPR}, 2018.
+
+\end{thebibliography}
+
+\end{document}
