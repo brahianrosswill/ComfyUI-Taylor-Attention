@@ -69,6 +69,35 @@ def test_kernel_regressor_attention_rectangular_and_masked():
     assert math.isfinite(layer.last_den_min)
 
 
+def test_kernel_regressor_attention_phi_network_is_three_layer_mlp():
+    shared = flux2_ttr.KernelRegressorAttention(head_dim=8, feature_dim=256, split_qk=False)
+    split = flux2_ttr.KernelRegressorAttention(head_dim=8, feature_dim=256, split_qk=True)
+
+    linear_q_shared = [m for m in shared.phi_net_q if isinstance(m, torch.nn.Linear)]
+    linear_k_shared = [m for m in shared.phi_net_k if isinstance(m, torch.nn.Linear)]
+    linear_q_split = [m for m in split.phi_net_q if isinstance(m, torch.nn.Linear)]
+    linear_k_split = [m for m in split.phi_net_k if isinstance(m, torch.nn.Linear)]
+    hidden_expected = max(8, 2 * 256)
+
+    assert len(linear_q_shared) == 3
+    assert len(linear_k_shared) == 3
+    assert len(linear_q_split) == 3
+    assert len(linear_k_split) == 3
+    assert linear_q_shared[0].in_features == 8
+    assert linear_q_shared[0].out_features == hidden_expected
+    assert linear_q_shared[1].in_features == hidden_expected
+    assert linear_q_shared[1].out_features == hidden_expected
+    assert linear_q_shared[2].in_features == hidden_expected
+    assert linear_q_shared[2].out_features == 256
+    assert linear_q_split[0].out_features == hidden_expected
+    assert linear_q_split[1].in_features == hidden_expected
+    assert linear_q_split[1].out_features == hidden_expected
+    assert linear_q_split[2].in_features == hidden_expected
+    assert linear_q_split[2].out_features == 256
+    assert shared.phi_net_q is shared.phi_net_k
+    assert split.phi_net_q is not split.phi_net_k
+
+
 def test_flux2_hkr_layer_shape_and_landmarks():
     torch.manual_seed(0)
     layer = flux2_ttr.Flux2HKRAttnLayer(

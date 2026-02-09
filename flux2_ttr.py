@@ -322,27 +322,29 @@ class KernelRegressorAttention(nn.Module):
         feature_dim: int,
         *,
         eps: float = 1e-6,
-        split_qk: bool = False,
+        split_qk: bool = True,
         qk_norm: bool = True,
     ):
         super().__init__()
         self.head_dim = int(head_dim)
         self.feature_dim = validate_feature_dim(feature_dim)
         self.eps = float(eps)
+        self.split_qk = bool(split_qk)
         self.qk_norm = bool(qk_norm)
 
-        hidden = max(self.feature_dim, self.head_dim)
-        self.phi_net_q = nn.Sequential(
-            nn.Linear(self.head_dim, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, self.feature_dim),
-        )
-        if split_qk:
-            self.phi_net_k = nn.Sequential(
+        hidden = max(self.head_dim, 2 * self.feature_dim)
+        def _build_phi_net() -> nn.Sequential:
+            return nn.Sequential(
                 nn.Linear(self.head_dim, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, hidden),
                 nn.SiLU(),
                 nn.Linear(hidden, self.feature_dim),
             )
+
+        self.phi_net_q = _build_phi_net()
+        if self.split_qk:
+            self.phi_net_k = _build_phi_net()
         else:
             self.phi_net_k = self.phi_net_q
 
@@ -478,7 +480,7 @@ class Flux2HKRAttnLayer(nn.Module):
         eps: float = 1e-6,
         query_chunk_size: int = _DEFAULT_Q_CHUNK,
         key_chunk_size: int = _DEFAULT_K_CHUNK,
-        split_qk: bool = False,
+        split_qk: bool = True,
         qk_norm: bool = True,
         landmark_fraction: float = _DEFAULT_LANDMARK_FRACTION,
         landmark_min: int = _DEFAULT_LANDMARK_MIN,
@@ -491,6 +493,7 @@ class Flux2HKRAttnLayer(nn.Module):
         self.head_dim = int(head_dim)
         self.feature_dim = validate_feature_dim(feature_dim)
         self.eps = float(eps)
+        self.split_qk = bool(split_qk)
         self.query_chunk_size = max(1, int(query_chunk_size))
         self.key_chunk_size = max(1, int(key_chunk_size))
         self.landmark_fraction = max(0.0, min(1.0, float(landmark_fraction)))
@@ -503,7 +506,7 @@ class Flux2HKRAttnLayer(nn.Module):
             head_dim=self.head_dim,
             feature_dim=self.feature_dim,
             eps=self.eps,
-            split_qk=split_qk,
+            split_qk=self.split_qk,
             qk_norm=qk_norm,
         )
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))

@@ -45,6 +45,7 @@ Inference:
 - Layer readiness now uses hysteresis (`exit = readiness_threshold * 1.2`) so layers do not flap at the readiness boundary.
 - Controller inference now logs per-step routing summaries (extracted sigma, controller threshold, and student-routed layer set) once per step.
 - `Flux2TTRController` supports `policy_mode` (`stochastic` or `threshold`). The default `stochastic` mode samples one controller mask per diffusion step (cached for all layer calls in that step) to match sigma-aware policy training behavior.
+- The HKR phi feature map MLP now uses split Q/K networks by default and a 3-layer shape (`head_dim -> hidden -> hidden -> feature_dim`) with two SiLU activations, where `hidden = max(head_dim, 2 * feature_dim)`, increasing kernel expressivity versus the previous 2-layer mapping.
 
 ## Utility Nodes
 
