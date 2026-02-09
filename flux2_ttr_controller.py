@@ -207,6 +207,67 @@ class TrainingControllerWrapper(nn.Module):
             result = result + float(weight) * rec["log_probs"].sum()
         return result
 
+    def sigma_weighted_log_prob_recompute(
+        self,
+        *,
+        cfg_scale: float,
+        width: int,
+        height: int,
+        sigma_max: Optional[float] = None,
+        eligible_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Recompute sigma-weighted trajectory log-prob from stored actions.
+
+        This path is robust even if step_records were collected in a context
+        where rec["log_probs"] became detached, because it re-evaluates
+        controller logits under grad-enabled mode using stored (sigma, mask).
+        """
+        if not self.step_records:
+            raise RuntimeError("TrainingControllerWrapper.sigma_weighted_log_prob_recompute: no step records collected.")
+        sigma_norm = max(
+            float(sigma_max) if sigma_max is not None else max(float(rec["sigma"]) for rec in self.step_records),
+            1e-8,
+        )
+
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                result: Optional[torch.Tensor] = None
+                for rec in self.step_records:
+                    logits = self.controller(
+                        sigma=float(rec["sigma"]),
+                        cfg_scale=float(cfg_scale),
+                        width=int(width),
+                        height=int(height),
+                    )
+                    if logits.ndim > 1:
+                        logits = logits.reshape(-1)
+                    probs = torch.sigmoid(logits.float()).clamp(min=1e-7, max=1.0 - 1e-7)
+                    mask = rec["mask"].to(device=probs.device, dtype=probs.dtype).reshape(-1).detach()
+                    if int(mask.numel()) != int(probs.numel()):
+                        raise ValueError(
+                            "TrainingControllerWrapper.sigma_weighted_log_prob_recompute: stored mask length "
+                            f"{int(mask.numel())} does not match controller layer count {int(probs.numel())}."
+                        )
+                    if eligible_mask is not None:
+                        eligible = eligible_mask.to(device=probs.device, dtype=torch.bool).reshape(-1)
+                        if int(eligible.numel()) != int(probs.numel()):
+                            raise ValueError(
+                                "TrainingControllerWrapper.sigma_weighted_log_prob_recompute: eligible_mask length "
+                                f"{int(eligible.numel())} does not match controller layer count {int(probs.numel())}."
+                            )
+                    else:
+                        eligible = torch.ones_like(probs, dtype=torch.bool)
+
+                    log_probs = mask * torch.log(probs) + (1.0 - mask) * torch.log(1.0 - probs)
+                    log_prob_sum = log_probs[eligible].sum()
+                    sigma_value = max(0.0, min(1.0, float(rec["sigma"]) / sigma_norm))
+                    weight = max(0.1, 1.0 - sigma_value)
+                    weighted = float(weight) * log_prob_sum
+                    result = weighted if result is None else (result + weighted)
+        if result is None:
+            raise RuntimeError("TrainingControllerWrapper.sigma_weighted_log_prob_recompute: no terms accumulated.")
+        return result
+
     def per_step_ttr_ratio(self) -> list[tuple[float, float]]:
         out: list[tuple[float, float]] = []
         for rec in self.step_records:

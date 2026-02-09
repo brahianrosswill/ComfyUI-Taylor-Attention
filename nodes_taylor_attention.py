@@ -1915,18 +1915,24 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             1e-8,
                             max(float(rec["sigma"]) for rec in training_wrapper.step_records),
                         )
-                        policy_loss_t = -float(baselined_reward) * training_wrapper.sigma_weighted_log_prob(
-                            sigma_max=sigma_max
+                        policy_loss_t = -float(baselined_reward) * training_wrapper.sigma_weighted_log_prob_recompute(
+                            cfg_scale=float(cfg),
+                            width=int(width),
+                            height=int(height),
+                            sigma_max=sigma_max,
+                            eligible_mask=ttr_eligible_mask_cpu,
                         )
                         if not bool(policy_loss_t.requires_grad):
-                            raise RuntimeError(
-                                "Flux2TTRControllerTrainer: sigma-aware policy loss is not connected to controller gradients."
+                            logger.warning(
+                                "Flux2TTRControllerTrainer: sigma-aware policy loss still detached after recompute; "
+                                "skipping optimizer step for this sample."
                             )
                         trainer.optimizer.zero_grad(set_to_none=True)
-                        policy_loss_t.backward()
-                        if trainer.grad_clip_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(trainer.controller.parameters(), trainer.grad_clip_norm)
-                        trainer.optimizer.step()
+                        if bool(policy_loss_t.requires_grad):
+                            policy_loss_t.backward()
+                            if trainer.grad_clip_norm > 0:
+                                torch.nn.utils.clip_grad_norm_(trainer.controller.parameters(), trainer.grad_clip_norm)
+                            trainer.optimizer.step()
 
                         step_ttr = training_wrapper.per_step_ttr_ratio()
                         sigma_max_val = max((s for s, _ in step_ttr), default=1.0)

@@ -206,6 +206,7 @@ Implementation details:
 - `TrainingControllerWrapper` now supports:
   - per-step stochastic mask sampling under runtime controller calls
   - trajectory-level policy-gradient aggregation helpers (`total_log_prob`, `sigma_weighted_log_prob`)
+  - robust trajectory-loss recomputation from stored `(sigma, mask)` actions (`sigma_weighted_log_prob_recompute`) so policy updates stay connected even if cached per-step log-probs become detached under host execution context
   - sigma diagnostics and ratio/entropy summaries for controller training logging
   - safe integration with inference-mode ComfyUI execution by wiring the runtime wrapper to `trainer.controller` (the trainer-managed trainable copy)
 

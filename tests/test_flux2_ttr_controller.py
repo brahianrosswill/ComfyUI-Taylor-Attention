@@ -133,6 +133,34 @@ def test_training_wrapper_per_step_ttr_ratio_varies_by_sigma(monkeypatch):
     assert per_step[1][1] == pytest.approx(0.0)
 
 
+def test_training_wrapper_recompute_sigma_weighted_log_prob_keeps_grad_path():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=8, hidden_dim=16)
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(
+        controller,
+        ready_mask=torch.tensor([1.0, 1.0, 0.0, 0.0], dtype=torch.float32),
+    )
+    with torch.no_grad():
+        wrapper(sigma=0.9, cfg_scale=4.0, width=64, height=64)
+        wrapper(sigma=0.1, cfg_scale=4.0, width=64, height=64)
+    for rec in wrapper.step_records:
+        rec["log_probs"] = rec["log_probs"].detach()
+
+    eligible = torch.tensor([True, True, False, False], dtype=torch.bool)
+    recomputed = wrapper.sigma_weighted_log_prob_recompute(
+        cfg_scale=4.0,
+        width=64,
+        height=64,
+        eligible_mask=eligible,
+    )
+    assert bool(recomputed.requires_grad)
+    recomputed.backward()
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum().item()) > 0.0
+        for p in controller.parameters()
+    )
+
+
 def test_ttr_controller_checkpoint_round_trip(tmp_path):
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
