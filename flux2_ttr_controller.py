@@ -117,11 +117,12 @@ class TrainingControllerWrapper(nn.Module):
             raise TypeError("TrainingControllerWrapper: controller must be an nn.Module.")
         self.controller = controller
         self.temperature = float(temperature)
-        self.ready_mask = (
-            ready_mask.detach().clone().reshape(-1).to(dtype=torch.float32)
-            if torch.is_tensor(ready_mask)
-            else None
-        )
+        with torch.inference_mode(False):
+            self.ready_mask = (
+                ready_mask.detach().clone().reshape(-1).to(dtype=torch.float32)
+                if torch.is_tensor(ready_mask)
+                else None
+            )
         self.step_records: list[dict[str, Any]] = []
 
     @staticmethod

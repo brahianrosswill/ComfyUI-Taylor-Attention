@@ -94,3 +94,4 @@
 - `docs/flux2ttr_v2_paper.tex` uses an inline `thebibliography`, so a reliable build script only needs multi-pass LaTeX (`latexmk` or two `pdflatex` passes) and no `bibtex` stage.
 - Controller sigma embeddings stay effectively unused if Phase-2 training freezes one `controller_mask_override` for an entire denoise run; routing must be sampled per diffusion step (live controller path) to learn sigma-dependent policies.
 - When controller modules are loaded/constructed under `inference_mode`, `ControllerTrainer` can rebuild a trainable copy; any training-time wrapper/runtime pointer must be rebound to `trainer.controller` or controller eval will fail with inference-tensor backward errors.
+- Running `module.to(device)` inside ComfyUI's inference-mode node context can produce inference tensors; for controller training, let `ControllerTrainer(..., device=...)` handle device moves inside `inference_mode(False)` and avoid pre-trainer `.to(...)`.

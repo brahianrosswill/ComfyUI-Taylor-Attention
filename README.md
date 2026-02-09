@@ -163,6 +163,7 @@ Flux2TTR is now split into four nodes:
   - Runs dual-path sampling (`model_original` teacher vs `model_ttr` student).
   - Computes RMSE/cosine/LPIPS quality delta and updates controller with REINFORCE.
   - LPIPS evaluation now auto-synchronizes module/input device placement per step to avoid CPU/CUDA mismatch errors.
+  - Controller weights are normalized to a trainable copy before trainer/wrapper wiring so ComfyUI inference-mode execution does not leave controller params as inference tensors.
   - `sigma_aware_training=true` (default) now wraps the controller with a per-step training wrapper, so routing decisions are sampled at each diffusion step using that step's sigma instead of freezing one mask for the whole trajectory.
   - Sigma-aware policy updates use a sigma-weighted trajectory log-prob objective (`wrapper.sigma_weighted_log_prob`) so late/low-sigma errors get stronger gradient signal.
   - Logs sigma-split diagnostics (`ttr_ratio_high_sigma`, `ttr_ratio_low_sigma`, `ttr_ratio_spread`, `steps_per_trajectory`) so you can verify the controller is actually differentiating by sigma.

@@ -1698,7 +1698,9 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         device = getattr(model_ttr, "load_device", None)
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        controller.to(device=device)
+        # ComfyUI may execute nodes under inference_mode; normalize the loaded
+        # controller into a trainable clone before constructing the trainer/wrapper.
+        controller = flux2_ttr_controller.ControllerTrainer._rebuild_controller_trainable_copy(controller)
         sigma_aware_training = bool(sigma_aware_training)
 
         trainer = flux2_ttr_controller.ControllerTrainer(
@@ -1711,10 +1713,11 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
         # was created under inference mode. Ensure runtime/wrapper/checkpoint all
         # use the trainer-owned instance.
         controller = trainer.controller
+        controller_device, _ = controller._input_device_dtype()
         training_wrapper = flux2_ttr_controller.TrainingControllerWrapper(
             controller,
             temperature=float(gumbel_start),
-            ready_mask=ttr_eligible_mask_cpu.to(device=device, dtype=torch.float32),
+            ready_mask=ttr_eligible_mask_cpu.to(device=controller_device, dtype=torch.float32),
         )
         flux_cfg["controller"] = training_wrapper if sigma_aware_training else controller
         flux_cfg["controller_threshold"] = 0.5
