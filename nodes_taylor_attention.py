@@ -1790,11 +1790,53 @@ class Flux2TTRController(io.ComfyNode):
             description="Inference node: load TTR + controller checkpoints and patch the model for dynamic layer routing.",
             inputs=[
                 io.Model.Input("model"),
-                io.String.Input("ttr_checkpoint_path", default="", multiline=False),
-                io.String.Input("controller_checkpoint_path", default="", multiline=False),
-                io.Float.Input("quality_speed", default=0.5, min=0.0, max=1.0, step=1e-3),
-                io.Combo.Input("policy_mode", options=["stochastic", "threshold"], default="stochastic"),
-                io.Float.Input("policy_temperature", default=1.0, min=1e-3, max=10.0, step=1e-3),
+                io.String.Input(
+                    "ttr_checkpoint_path",
+                    default="",
+                    multiline=False,
+                    tooltip="Path to the Phase-1 TTR checkpoint (distilled attention layers).",
+                ),
+                io.String.Input(
+                    "controller_checkpoint_path",
+                    default="",
+                    multiline=False,
+                    tooltip="Path to the Phase-2 controller checkpoint used for per-step routing decisions.",
+                ),
+                io.Float.Input(
+                    "quality_speed",
+                    default=0.5,
+                    min=0.0,
+                    max=1.0,
+                    step=1e-3,
+                    tooltip=(
+                        "Quality/speed tradeoff. Internally mapped to controller threshold "
+                        "(0.1 + 0.8 * quality_speed). Higher values keep more layers on full attention "
+                        "(usually higher quality, lower speed). Lower values route more layers to TTR "
+                        "(usually faster, potentially lower quality)."
+                    ),
+                ),
+                io.Combo.Input(
+                    "policy_mode",
+                    options=["stochastic", "threshold"],
+                    default="stochastic",
+                    tooltip=(
+                        "Inference routing policy. 'stochastic' samples one controller mask per diffusion step "
+                        "(matching sigma-aware training behavior). 'threshold' uses deterministic thresholding "
+                        "from controller probabilities."
+                    ),
+                ),
+                io.Float.Input(
+                    "policy_temperature",
+                    default=1.0,
+                    min=1e-3,
+                    max=10.0,
+                    step=1e-3,
+                    tooltip=(
+                        "Sampling temperature used only when policy_mode='stochastic'. "
+                        "Lower values make decisions harder/more deterministic near the threshold; "
+                        "higher values make decisions softer/more random."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
             is_experimental=True,
