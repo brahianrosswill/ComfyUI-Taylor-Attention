@@ -1537,6 +1537,19 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
             return False
 
     @staticmethod
+    def _inference_tensor_count(module: torch.nn.Module) -> int:
+        count = 0
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            checker = getattr(tensor, "is_inference", None)
+            if callable(checker):
+                try:
+                    if bool(checker()):
+                        count += 1
+                except Exception:
+                    pass
+        return int(count)
+
+    @staticmethod
     def _maybe_start_comet(
         logging_cfg: dict[str, Any],
         training_config: dict[str, dict[str, Any]],
@@ -1923,9 +1936,55 @@ class Flux2TTRControllerTrainer(io.ComfyNode):
                             eligible_mask=ttr_eligible_mask_cpu,
                         )
                         if not bool(policy_loss_t.requires_grad):
+                            repaired = 0
+                            with torch.inference_mode(False):
+                                for p in trainer.controller.parameters():
+                                    if not bool(p.requires_grad):
+                                        p.requires_grad_(True)
+                                        repaired += 1
+                            if repaired > 0:
+                                policy_loss_t = -float(baselined_reward) * training_wrapper.sigma_weighted_log_prob_recompute(
+                                    cfg_scale=float(cfg),
+                                    width=int(width),
+                                    height=int(height),
+                                    sigma_max=sigma_max,
+                                    eligible_mask=ttr_eligible_mask_cpu,
+                                )
+                                if bool(policy_loss_t.requires_grad):
+                                    logger.info(
+                                        "Flux2TTRControllerTrainer: restored detached sigma-aware policy loss by re-enabling requires_grad on %d controller params.",
+                                        int(repaired),
+                                    )
+                            param_list = list(trainer.controller.parameters())
+                            trainable_params = int(sum(1 for p in param_list if bool(p.requires_grad)))
+                            inference_params = cls._inference_tensor_count(trainer.controller)
+                            probe_requires_grad: Optional[bool] = None
+                            probe_error = ""
+                            try:
+                                probe_sigma = float(training_wrapper.step_records[0]["sigma"])
+                                with torch.inference_mode(False):
+                                    with torch.enable_grad():
+                                        probe_logits = trainer.controller(
+                                            sigma=probe_sigma,
+                                            cfg_scale=float(cfg),
+                                            width=int(width),
+                                            height=int(height),
+                                        )
+                                if probe_logits.ndim > 1:
+                                    probe_logits = probe_logits.reshape(-1)
+                                probe_requires_grad = bool(probe_logits.requires_grad)
+                            except Exception as exc:
+                                probe_error = str(exc)
                             logger.warning(
                                 "Flux2TTRControllerTrainer: sigma-aware policy loss still detached after recompute; "
-                                "skipping optimizer step for this sample."
+                                "skipping optimizer step for this sample. "
+                                "diag: trainable_params=%d/%d inference_tensors=%d probe_requires_grad=%s probe_error=%s repaired_params=%d",
+                                trainable_params,
+                                int(len(param_list)),
+                                inference_params,
+                                probe_requires_grad,
+                                probe_error or "<none>",
+                                int(repaired),
                             )
                         trainer.optimizer.zero_grad(set_to_none=True)
                         if bool(policy_loss_t.requires_grad):

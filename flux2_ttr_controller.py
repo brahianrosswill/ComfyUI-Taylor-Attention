@@ -249,7 +249,12 @@ class TrainingControllerWrapper(nn.Module):
                             f"{int(mask.numel())} does not match controller layer count {int(probs.numel())}."
                         )
                     if eligible_mask is not None:
-                        eligible = eligible_mask.to(device=probs.device, dtype=torch.bool).reshape(-1)
+                        eligible = (
+                            eligible_mask.to(device=probs.device, dtype=torch.bool)
+                            .reshape(-1)
+                            .detach()
+                            .clone()
+                        )
                         if int(eligible.numel()) != int(probs.numel()):
                             raise ValueError(
                                 "TrainingControllerWrapper.sigma_weighted_log_prob_recompute: eligible_mask length "

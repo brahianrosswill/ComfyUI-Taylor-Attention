@@ -161,6 +161,24 @@ def test_training_wrapper_recompute_sigma_weighted_log_prob_keeps_grad_path():
     )
 
 
+def test_training_wrapper_recompute_handles_inference_eligible_mask():
+    torch.manual_seed(0)
+    controller = flux2_ttr_controller.TTRController(num_layers=2, embed_dim=8, hidden_dim=16)
+    wrapper = flux2_ttr_controller.TrainingControllerWrapper(controller)
+    with torch.no_grad():
+        wrapper(sigma=0.4, cfg_scale=4.0, width=64, height=64)
+    with torch.inference_mode():
+        eligible = torch.tensor([True, False], dtype=torch.bool)
+
+    loss = wrapper.sigma_weighted_log_prob_recompute(
+        cfg_scale=4.0,
+        width=64,
+        height=64,
+        eligible_mask=eligible,
+    )
+    assert bool(loss.requires_grad)
+
+
 def test_ttr_controller_checkpoint_round_trip(tmp_path):
     torch.manual_seed(0)
     controller = flux2_ttr_controller.TTRController(num_layers=4, embed_dim=16, hidden_dim=32)
