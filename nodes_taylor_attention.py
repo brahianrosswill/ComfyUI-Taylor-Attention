@@ -1810,8 +1810,8 @@ class Flux2TTRController(io.ComfyNode):
                     step=1e-3,
                     tooltip=(
                         "Quality/speed tradeoff. Internally mapped to controller threshold "
-                        "(0.1 + 0.8 * quality_speed). Higher values keep more layers on full attention "
-                        "(usually higher quality, lower speed). Lower values route more layers to TTR "
+                        "(0.1 + 0.8 * quality_speed). Lower values keep more layers on full attention "
+                        "(usually higher quality, lower speed). Higher values route more layers to TTR "
                         "(usually faster, potentially lower quality)."
                     ),
                 ),
