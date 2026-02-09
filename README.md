@@ -43,6 +43,7 @@ Inference:
 - Comet logging now emits latest per-layer metrics for all tracked layers at each log tick, plus `flux2ttr/global/pareto_frontier` for ready-layer quality/coverage tracking.
 - Phase-1 TTR Comet logging now supports persistent experiments across ComfyUI sampling runs when `comet_experiment` is set, reusing the same Comet run key instead of ending at each cleanup.
 - Layer readiness now uses hysteresis (`exit = readiness_threshold * 1.2`) so layers do not flap at the readiness boundary.
+- Controller inference now logs per-step routing summaries (extracted sigma, controller threshold, and student-routed layer set) once per step.
 
 ## Utility Nodes
 

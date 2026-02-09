@@ -426,6 +426,85 @@ def test_runtime_inference_controller_mask_routes_teacher_vs_student(monkeypatch
     assert torch.all(out1 == 42.0)
 
 
+def test_runtime_inference_controller_logs_routing_once_per_step(monkeypatch, caplog):
+    class _Controller(torch.nn.Module):
+        def forward(self, sigma, cfg_scale, width, height):
+            del cfg_scale, width, height
+            s = float(sigma)
+            if s >= 0.7:
+                # student on single:1,single:2
+                return torch.tensor([2.0, -2.0, -2.0], dtype=torch.float32)
+            # student on single:0,single:2
+            return torch.tensor([-2.0, 2.0, -2.0], dtype=torch.float32)
+
+    runtime = flux2_ttr.Flux2TTRRuntime(feature_dim=256, learning_rate=1e-3, training=False, steps=0)
+    runtime.register_layer_specs(
+        [
+            flux2_ttr.FluxLayerSpec(layer_key="single:0", num_heads=2, head_dim=4),
+            flux2_ttr.FluxLayerSpec(layer_key="single:1", num_heads=2, head_dim=4),
+            flux2_ttr.FluxLayerSpec(layer_key="single:2", num_heads=2, head_dim=4),
+        ]
+    )
+    for key in ("single:0", "single:1", "single:2"):
+        runtime.layer_update_count[key] = 99
+        runtime.layer_ema_loss[key] = 0.0
+        runtime.layer_ready[key] = True
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn(1, 2, 6, 4)
+
+    def fallback(q_arg, k_arg, v_arg, pe_arg, mask=None, transformer_options=None):
+        del pe_arg, transformer_options
+        return _baseline_flat(q_arg, k_arg, v_arg, mask=mask)
+
+    def fake_student(**kwargs):
+        q_eff = kwargs["q_eff"]
+        v_arg = kwargs["v"]
+        return torch.full((q_eff.shape[0], q_eff.shape[2], q_eff.shape[1] * q_eff.shape[3]), 19.0, dtype=v_arg.dtype)
+
+    monkeypatch.setattr(runtime, "_student_from_runtime", fake_student)
+    controller = _Controller()
+
+    caplog.set_level(logging.INFO, logger="flux2_ttr")
+
+    opts_step0_l0 = {
+        "block_type": "single",
+        "block_index": 0,
+        "step": 0,
+        "sigmas": torch.tensor([0.9]),
+        "flux2_ttr": {"controller": controller, "controller_threshold": 0.5},
+    }
+    opts_step0_l1 = {
+        "block_type": "single",
+        "block_index": 1,
+        "step": 0,
+        "sigmas": torch.tensor([0.9]),
+        "flux2_ttr": {"controller": controller, "controller_threshold": 0.5},
+    }
+    opts_step1_l2 = {
+        "block_type": "single",
+        "block_index": 2,
+        "step": 1,
+        "sigmas": torch.tensor([0.5]),
+        "flux2_ttr": {"controller": controller, "controller_threshold": 0.5},
+    }
+
+    runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step0_l0, fallback_attention=fallback)
+    runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step0_l1, fallback_attention=fallback)
+    runtime.run_attention(q, k, v, pe=None, mask=None, transformer_options=opts_step1_l2, fallback_attention=fallback)
+
+    routing_logs = [rec.getMessage() for rec in caplog.records if "Flux2TTR controller step routing:" in rec.getMessage()]
+    assert len(routing_logs) == 2
+    assert "step_id=('step', 0)" in routing_logs[0]
+    assert "extracted_sigma=0.9" in routing_logs[0]
+    assert "controller_threshold=0.5" in routing_logs[0]
+    assert "[single:1,single:2]" in routing_logs[0]
+    assert "step_id=('step', 1)" in routing_logs[1]
+    assert "extracted_sigma=0.5" in routing_logs[1]
+    assert "[single:0,single:2]" in routing_logs[1]
+
+
 def test_runtime_inference_controller_mask_override_routes_without_controller_call(monkeypatch):
     class _Controller(torch.nn.Module):
         def forward(self, sigma, cfg_scale, width, height):

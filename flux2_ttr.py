@@ -816,6 +816,7 @@ class Flux2TTRRuntime:
         self._current_step_eligible_count = 0
         self._controller_cache_key: Optional[Any] = None
         self._controller_cache_mask: Optional[torch.Tensor] = None
+        self._controller_debug_last_step_key: Optional[Any] = None
 
     @staticmethod
     def _layer_sort_key(layer_key: str) -> tuple[str, int]:
@@ -986,6 +987,7 @@ class Flux2TTRRuntime:
         self._current_step_eligible_count = 0
         self._controller_cache_key = None
         self._controller_cache_mask = None
+        self._controller_debug_last_step_key = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1235,6 +1237,76 @@ class Flux2TTRRuntime:
         self._controller_cache_key = step_id
         self._controller_cache_mask = mask
         return mask
+
+    def _controller_student_layer_set(
+        self,
+        controller_mask: torch.Tensor,
+        controller_threshold: float,
+        transformer_options: Optional[dict],
+        current_layer_key: str,
+    ) -> tuple[list[str], int]:
+        eligible_layers = self._eligible_single_layer_keys(
+            current_layer_key=current_layer_key,
+            transformer_options=transformer_options,
+        )
+        student_layers: list[str] = []
+        mask_len = int(controller_mask.numel())
+        for layer_key in eligible_layers:
+            idx = self._extract_layer_index(layer_key)
+            if idx is None or idx < 0 or idx >= mask_len:
+                continue
+            if float(controller_mask[idx].item()) <= float(controller_threshold):
+                student_layers.append(layer_key)
+        student_layers.sort(key=self._layer_sort_key)
+        return student_layers, len(eligible_layers)
+
+    def _maybe_log_controller_step_routing(
+        self,
+        *,
+        transformer_options: Optional[dict],
+        controller_mask: torch.Tensor,
+        controller_threshold: float,
+        sigma: Optional[float],
+        cfg_scale: float,
+        width: int,
+        height: int,
+        current_layer_key: str,
+    ) -> None:
+        step_id = self._extract_step_id(transformer_options)
+        sigma_value = float(sigma) if sigma is not None else float("nan")
+        sigma_key = round(sigma_value, 10) if math.isfinite(sigma_value) else None
+        key = (
+            step_id,
+            sigma_key,
+            round(float(cfg_scale), 6),
+            round(float(controller_threshold), 6),
+            int(width),
+            int(height),
+        )
+        if key == self._controller_debug_last_step_key:
+            return
+        self._controller_debug_last_step_key = key
+
+        student_layers, total_layers = self._controller_student_layer_set(
+            controller_mask=controller_mask,
+            controller_threshold=controller_threshold,
+            transformer_options=transformer_options,
+            current_layer_key=current_layer_key,
+        )
+        sigma_text = f"{sigma_value:.6g}" if math.isfinite(sigma_value) else "nan"
+        logger.info(
+            (
+                "Flux2TTR controller step routing: step_id=%r extracted_sigma=%s "
+                "controller_threshold=%.4g cfg_scale=%.4g student_layers=%d/%d [%s]"
+            ),
+            step_id,
+            sigma_text,
+            float(controller_threshold),
+            float(cfg_scale),
+            len(student_layers),
+            int(total_layers),
+            self._format_layer_list(student_layers),
+        )
 
     def _ensure_optimizer(self, layer: Flux2HKRAttnLayer) -> torch.optim.Optimizer:
         alpha_params = [layer.alpha]
@@ -2078,6 +2150,16 @@ class Flux2TTRRuntime:
                     ).reshape(-1)
                 else:
                     controller_mask = self._get_controller_mask(controller, sigma, cfg_scale, width, height)
+                self._maybe_log_controller_step_routing(
+                    transformer_options=transformer_options,
+                    controller_mask=controller_mask,
+                    controller_threshold=controller_threshold,
+                    sigma=sigma,
+                    cfg_scale=cfg_scale,
+                    width=width,
+                    height=height,
+                    current_layer_key=layer_key,
+                )
                 layer_idx = self._extract_layer_index(layer_key)
                 if layer_idx is None or layer_idx < 0 or layer_idx >= int(controller_mask.numel()):
                     logger.warning(
@@ -2438,6 +2520,7 @@ class Flux2TTRRuntime:
         self._current_step_eligible_count = 0
         self._controller_cache_key = None
         self._controller_cache_mask = None
+        self._controller_debug_last_step_key = None
 
         logger.info("Flux2TTR: loaded checkpoint from %s (%d layers).", path, len(self.pending_state))
 
